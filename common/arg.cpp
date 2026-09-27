@@ -8,6 +8,7 @@
 #include "json.h"
 #include "llama.h"
 #include "log.h"
+#include "reasoning-penalty.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
@@ -3728,6 +3729,77 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.reasoning_budget_message = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-penalty-words"}, "LIST",
+        "comma-separated marker words penalized inside the reasoning block, or 'default' for the built-in list (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_penalty.words.clear();
+            if (value == "default") {
+                params.sampling.reasoning_penalty.words = common_reasoning_penalty_default_words();
+                return;
+            }
+            for (const auto & word : string_split<std::string>(value, ',')) {
+                const std::string w = string_strip(word);
+                if (!w.empty()) {
+                    params.sampling.reasoning_penalty.words.push_back(w);
+                }
+            }
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PENALTY_WORDS"));
+    add_opt(common_arg(
+        {"--reasoning-penalty-words-file"}, "FNAME",
+        "file to read reasoning penalty words from, one per line ('#' comments and blank lines are ignored, lines starting with '=' are kept as is)",
+        [](common_params & params, const std::string & value) {
+            std::ifstream file(value);
+            if (!file) {
+                throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
+            }
+            params.sampling.reasoning_penalty.words.clear();
+            std::string line;
+            while (std::getline(file, line)) {
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                // '=' lines are literal pieces, whitespace may be part of the piece
+                if (line.empty() || line[0] != '=') {
+                    line = string_strip(line);
+                }
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                params.sampling.reasoning_penalty.words.push_back(line);
+            }
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PENALTY_WORDS_FILE"));
+    add_opt(common_arg(
+        {"--reasoning-penalty-start"}, "N",
+        string_format("reasoning penalty at the start of a reasoning block (default: %.2f)", (double)params.sampling.reasoning_penalty.start),
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_penalty.start = std::stof(value);
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PENALTY_START"));
+    add_opt(common_arg(
+        {"--reasoning-penalty-step"}, "N",
+        string_format("reasoning penalty increase per trigger marker in the reasoning block (default: %.2f)", (double)params.sampling.reasoning_penalty.step),
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_penalty.step = std::stof(value);
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PENALTY_STEP"));
+    add_opt(common_arg(
+        {"--reasoning-penalty-max"}, "N",
+        string_format("maximum reasoning penalty (default: %.2f)", (double)params.sampling.reasoning_penalty.max),
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_penalty.max = std::stof(value);
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PENALTY_MAX"));
+    add_opt(common_arg(
+        {"--reasoning-penalty-window"}, "N",
+        string_format("count reasoning penalty triggers only in the last N reasoning tokens, 0 = whole block (default: %d)", params.sampling.reasoning_penalty.window),
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_penalty.window = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PENALTY_WINDOW"));
     add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},

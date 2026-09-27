@@ -1,6 +1,7 @@
 #include "server-schema.h"
 
 #include "json-schema-to-grammar.h"
+#include "reasoning-penalty.h"
 
 namespace server_schema {
 
@@ -430,6 +431,31 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 ctx.params.sampling.reasoning_budget_forced = std::move(end_tag);
             }
         }));
+
+    add((new field_nested("reasoning_penalty"))
+        ->add_subfield((new field_json("words"))
+            ->set_desc("Marker words penalized inside the reasoning block, or \"default\" for the built-in list. An empty list disables the penalty")
+            ->set_handler([&](field_eval_context & ctx, const json & data) {
+                const auto & words = data.at("words");
+                if (words.is_string()) {
+                    if (words.get<std::string>() != "default") {
+                        throw std::invalid_argument("must be an array of strings or \"default\"");
+                    }
+                    ctx.params.sampling.reasoning_penalty.words = common_reasoning_penalty_default_words();
+                } else {
+                    ctx.params.sampling.reasoning_penalty.words = words.get<std::vector<std::string>>();
+                }
+            }))
+        ->add_subfield((new field_num("start", params.sampling.reasoning_penalty.start))
+            ->set_desc("Reasoning penalty at the start of a reasoning block"))
+        ->add_subfield((new field_num("step", params.sampling.reasoning_penalty.step))
+            ->set_desc("Reasoning penalty increase per trigger marker in the reasoning block"))
+        ->add_subfield((new field_num("max", params.sampling.reasoning_penalty.max))
+            ->set_desc("Maximum reasoning penalty"))
+        ->add_subfield((new field_num("window", params.sampling.reasoning_penalty.window))
+            ->set_hard_limits(0, INT32_MAX)
+            ->set_desc("Count triggers only in the last N reasoning tokens (0 = whole block)"))
+        ->set_desc("Penalty on overthinking marker words, applied only inside the reasoning block"));
 
     add((new field_json("logit_bias"))
         ->set_desc("Modify the likelihood of specific tokens. Accepts an array of [token, bias] pairs or an object mapping token to bias. Use false as bias to ban a token")

@@ -93,6 +93,12 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// true if the reasoning penalty (if any) is applied to the next token, i.e. inside the reasoning block
+bool common_sampler_reasoning_penalty_active(const struct common_sampler * gsmpl);
+
+// get the reasoning penalty sampler, nullptr if not used
+const struct llama_sampler * common_sampler_get_reasoning_penalty(const struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens

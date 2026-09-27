@@ -341,6 +341,8 @@ struct server_task_result_cmpl_final : server_task_result {
 
     task_params generation_params;
 
+    json reasoning_penalty; // reasoning penalty stats, null if not used
+
     // response formatting
     bool               verbose  = false;
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;

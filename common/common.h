@@ -221,6 +221,15 @@ inline bool common_grammar_needs_prefill(const common_grammar & g) {
         || g.type == COMMON_GRAMMAR_TYPE_TOOL_CALLS;
 }
 
+// penalty on overthinking marker words, applied only inside the reasoning block
+struct common_params_reasoning_penalty {
+    std::vector<std::string> words;   // empty = disabled
+    float   start  = 0.0f;            // penalty at n = 0
+    float   step   = 0.25f;           // added per trigger emitted in this block
+    float   max    = 3.0f;            // cap
+    int32_t window = 0;               // 0 = whole block, else triggers in the last N thinking tokens
+};
+
 // sampling parameters
 struct common_params_sampling {
     uint32_t seed = LLAMA_DEFAULT_SEED; // the seed used to initialize llama_sampler
@@ -293,6 +302,8 @@ struct common_params_sampling {
     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+
+    common_params_reasoning_penalty reasoning_penalty;
 
     bool backend_sampling = false;
 

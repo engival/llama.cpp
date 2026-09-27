@@ -136,6 +136,12 @@
 | `-j, --json-schema SCHEMA` | JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
+| `--reasoning-penalty-words LIST` | comma-separated marker words penalized inside the reasoning block, or 'default' for the built-in list (default: disabled)<br/>(env: LLAMA_ARG_REASONING_PENALTY_WORDS) |
+| `--reasoning-penalty-words-file FNAME` | file to read reasoning penalty words from, one per line ('#' comments and blank lines are ignored, lines starting with '=' are kept as is)<br/>(env: LLAMA_ARG_REASONING_PENALTY_WORDS_FILE) |
+| `--reasoning-penalty-start N` | reasoning penalty at the start of a reasoning block (default: 0.00)<br/>(env: LLAMA_ARG_REASONING_PENALTY_START) |
+| `--reasoning-penalty-step N` | reasoning penalty increase per trigger marker in the reasoning block (default: 0.25)<br/>(env: LLAMA_ARG_REASONING_PENALTY_STEP) |
+| `--reasoning-penalty-max N` | maximum reasoning penalty (default: 3.00)<br/>(env: LLAMA_ARG_REASONING_PENALTY_MAX) |
+| `--reasoning-penalty-window N` | count reasoning penalty triggers only in the last N reasoning tokens, 0 = whole block (default: 0)<br/>(env: LLAMA_ARG_REASONING_PENALTY_WINDOW) |
 
 
 ### CLI-specific params

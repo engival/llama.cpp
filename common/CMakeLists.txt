@@ -103,6 +103,8 @@ add_library(${TARGET}
     preset.h
     reasoning-budget.cpp
     reasoning-budget.h
+    reasoning-penalty.cpp
+    reasoning-penalty.h
     sampling.cpp
     sampling.h
     speculative.cpp

@@ -12,6 +12,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "reasoning-penalty.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -2145,6 +2146,22 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        if (const auto * rpenalty = common_sampler_get_reasoning_penalty(slot.smpl.get())) {
+            const auto stats = common_reasoning_penalty_get_stats(rpenalty);
+
+            json hits = json::object();
+            for (const auto & [label, count] : stats.hits) {
+                hits[label] = count;
+            }
+
+            res->reasoning_penalty = json {
+                {"triggers",        stats.triggers},
+                {"markers",         stats.markers},
+                {"tokens_in_think", stats.tokens_in_think},
+                {"hits",            hits},
+            };
+        }
 
         queue_results.send(std::move(res));
     }

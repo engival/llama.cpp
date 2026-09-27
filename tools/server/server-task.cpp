@@ -39,6 +39,14 @@ json task_params::to_json(bool only_metrics) const {
         lora.push_back({{"id", it.first}, {"scale", it.second}});
     }
 
+    json reasoning_penalty = {
+        {"words",  sampling.reasoning_penalty.words},
+        {"start",  sampling.reasoning_penalty.start},
+        {"step",   sampling.reasoning_penalty.step},
+        {"max",    sampling.reasoning_penalty.max},
+        {"window", sampling.reasoning_penalty.window},
+    };
+
     if (only_metrics) {
         return json {
             {"seed",                      sampling.seed},
@@ -78,6 +86,7 @@ json task_params::to_json(bool only_metrics) const {
             {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
             {"generation_prompt",         chat_parser_params.generation_prompt},
             {"samplers",                  samplers},
+            {"reasoning_penalty",         reasoning_penalty},
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
@@ -137,6 +146,7 @@ json task_params::to_json(bool only_metrics) const {
         {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
         {"generation_prompt",         chat_parser_params.generation_prompt},
         {"samplers",                  samplers},
+        {"reasoning_penalty",         reasoning_penalty},
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
@@ -356,6 +366,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"tokens_cached",       n_tokens_cached},
         {"timings",             stats.to_json()},
     };
+    if (!reasoning_penalty.is_null()) {
+        res["reasoning_penalty"] = reasoning_penalty;
+    }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
@@ -407,6 +420,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
     }
+    if (!reasoning_penalty.is_null()) {
+        res["reasoning_penalty"] = reasoning_penalty;
+    }
 
     return res;
 }
@@ -454,6 +470,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
+    }
+    if (!reasoning_penalty.is_null()) {
+        res["reasoning_penalty"] = reasoning_penalty;
     }
 
     return res;
@@ -515,6 +534,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
     if (stats.is_set()) {
         deltas.back()["timings"] = stats.to_json();
+    }
+    if (!reasoning_penalty.is_null()) {
+        deltas.back()["reasoning_penalty"] = reasoning_penalty;
     }
 
     // extra fields for debugging purposes
@@ -592,6 +614,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
     };
+    if (!reasoning_penalty.is_null()) {
+        res["reasoning_penalty"] = reasoning_penalty;
+    }
 
     return res;
 }
@@ -709,6 +734,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     if (stats.is_set()) {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
     }
+    if (!reasoning_penalty.is_null()) {
+        server_sent_events.back().at("data")["reasoning_penalty"] = reasoning_penalty;
+    }
 
     return server_sent_events;
 }
@@ -790,6 +818,9 @@ json server_task_result_cmpl_final::to_json_anthropic() {
             {"output_tokens", n_decoded}
         }}
     };
+    if (!reasoning_penalty.is_null()) {
+        res["reasoning_penalty"] = reasoning_penalty;
+    }
 
     return res;
 }
@@ -971,6 +1002,9 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
             }}
         }}
     });
+    if (!reasoning_penalty.is_null()) {
+        events.back().at("data")["reasoning_penalty"] = reasoning_penalty;
+    }
 
     events.push_back({
         {"event", "message_stop"},

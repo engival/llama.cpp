@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "reasoning-penalty.h"
 
 #include "ggml.h"
 
@@ -113,6 +114,7 @@ struct common_sampler {
 
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
+    struct llama_sampler * rpenalty;
     struct llama_sampler * chain;
 
     ring_buffer<llama_token> prev;
@@ -181,7 +183,13 @@ std::string common_params_sampling::print() const {
             top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp,
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
-    return std::string(result);
+    std::string res(result);
+    if (!reasoning_penalty.words.empty()) {
+        res += string_format("\n\treasoning_penalty: words = %zu, start = %.3f, step = %.3f, max = %.3f, window = %d",
+                reasoning_penalty.words.size(), reasoning_penalty.start, reasoning_penalty.step, reasoning_penalty.max, reasoning_penalty.window);
+    }
+
+    return res;
 }
 
 struct common_sampler * common_sampler_init(
@@ -205,6 +213,7 @@ struct common_sampler * common_sampler_init(
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    llama_sampler * rpenalty = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
@@ -307,8 +316,48 @@ struct common_sampler * common_sampler_init(
         }
     }
 
+    const bool has_reasoning_tags = !params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty();
+
+    // reasoning penalty words, resolved before the reasoning budget sampler because it is needed only if a word resolves
+    std::vector<common_reasoning_penalty_entry> rpenalty_entries;
+    if (!params.reasoning_penalty.words.empty()) {
+        // this runs for every request: log at info level only once per process
+        static bool logged_inactive = false;
+        static bool logged_dropped  = false;
+
+        if (!has_reasoning_tags) {
+            if (!logged_inactive) {
+                logged_inactive = true;
+                LOG_INF("%s: reasoning penalty is inactive: no reasoning start/end tags\n", __func__);
+            }
+        } else {
+            std::vector<std::string> dropped;
+            rpenalty_entries = common_reasoning_penalty_resolve(vocab, params.reasoning_penalty.words, &dropped);
+
+            if (!dropped.empty()) {
+                std::string list;
+                for (const auto & d : dropped) {
+                    list += (list.empty() ? "'" : ", '") + d + "'";
+                }
+                LOG_DBG("%s: reasoning penalty: skipped %zu spellings that are not a single token: %s\n", __func__, dropped.size(), list.c_str());
+                if (!logged_dropped) {
+                    logged_dropped = true;
+                    LOG_INF("%s: reasoning penalty: some spellings are not a single token and are skipped (see debug log for the list)\n", __func__);
+                }
+            }
+
+            if (rpenalty_entries.empty() && !logged_inactive) {
+                logged_inactive = true;
+                LOG_WRN("%s: reasoning penalty is inactive: no word resolves to a single token\n", __func__);
+            }
+        }
+    }
+
+    const bool use_rpenalty = !rpenalty_entries.empty();
+
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+    // the reasoning penalty also needs it to track the thinking state
+    if (has_reasoning_tags && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control || use_rpenalty)) {
         rbudget = common_reasoning_budget_init(
             vocab,
             {params.reasoning_budget_start},
@@ -316,10 +365,16 @@ struct common_sampler * common_sampler_init(
             params.reasoning_budget_forced,
             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
 
+        // prefill tokens are not fed to the reasoning penalty: markers in prefilled text are not counted
         for (const auto & token : prefill_tokens) {
             llama_sampler_accept(rbudget, token);
             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
         }
+    }
+
+    if (use_rpenalty) {
+        rpenalty = common_reasoning_penalty_init(vocab, std::move(rpenalty_entries),
+                params.reasoning_penalty.start, params.reasoning_penalty.step, params.reasoning_penalty.max, params.reasoning_penalty.window);
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
@@ -418,6 +473,12 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    if (rpenalty && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with reasoning penalty, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
     if (rbudget && params.backend_sampling) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
 
@@ -428,6 +489,7 @@ struct common_sampler * common_sampler_init(
         /* .params  = */ params,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
+        /* .rpenalty = */ rpenalty,
         /* .chain   = */ chain,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
@@ -444,6 +506,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
 
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
+    llama_sampler_free(gsmpl->rpenalty);
     llama_sampler_free(gsmpl->chain);
 
     delete gsmpl;
@@ -464,6 +527,10 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+static bool rpenalty_should_apply(const struct common_sampler * gsmpl) {
+    return gsmpl->rpenalty && gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_COUNTING;
+}
+
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
     if (!gsmpl) {
         return;
@@ -475,7 +542,18 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     const auto accept_grammar = is_generated && grammar_should_apply(gsmpl);
 
     if (gsmpl->rbudget && is_generated) {
+        // the penalty was applied based on the state at sampling time, i.e. before this accept
+        const auto rbudget_state = common_reasoning_budget_get_state(gsmpl->rbudget);
+
         llama_sampler_accept(gsmpl->rbudget, token);
+
+        if (gsmpl->rpenalty) {
+            if (rbudget_state == REASONING_BUDGET_COUNTING) {
+                llama_sampler_accept(gsmpl->rpenalty, token);
+            } else if (common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_COUNTING) {
+                common_reasoning_penalty_new_block(gsmpl->rpenalty);
+            }
+        }
 
         // if done, replay end sequence which may contain a grammar trigger
         const bool is_done = common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE;
@@ -511,6 +589,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .rpenalty = */ llama_sampler_clone(gsmpl->rpenalty),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
@@ -525,10 +604,12 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
+    GGML_ASSERT((src->rpenalty == nullptr) == (dst->rpenalty == nullptr));
 
-    llama_sampler_copy(src->grmr,    dst->grmr);
-    llama_sampler_copy(src->rbudget, dst->rbudget);
-    llama_sampler_copy(src->chain,   dst->chain);
+    llama_sampler_copy(src->grmr,     dst->grmr);
+    llama_sampler_copy(src->rbudget,  dst->rbudget);
+    llama_sampler_copy(src->rpenalty, dst->rpenalty);
+    llama_sampler_copy(src->chain,    dst->chain);
 
     dst->params     = src->params;
     dst->prev       = src->prev;
@@ -616,6 +697,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            GGML_ASSERT(!gsmpl->rpenalty && "using reasoning penalty in combination with backend sampling is not supported");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -630,6 +712,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
+
+    if (rpenalty_should_apply(gsmpl)) {
+        llama_sampler_apply(gsmpl->rpenalty, &cur_p);
+    }
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr, &cur_p);
@@ -661,6 +747,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     gsmpl->set_logits(ctx, idx);
 
     llama_sampler_apply(rbudget,  &cur_p);
+
+    if (rpenalty_should_apply(gsmpl)) {
+        llama_sampler_apply(gsmpl->rpenalty, &cur_p);
+    }
 
     if (grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr,  &cur_p);
@@ -724,6 +814,22 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+bool common_sampler_reasoning_penalty_active(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+
+    return rpenalty_should_apply(gsmpl);
+}
+
+const struct llama_sampler * common_sampler_get_reasoning_penalty(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return nullptr;
+    }
+
+    return gsmpl->rpenalty;
 }
 
 // helpers

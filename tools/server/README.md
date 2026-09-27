@@ -153,6 +153,12 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-j, --json-schema SCHEMA` | JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
+| `--reasoning-penalty-words LIST` | comma-separated marker words penalized inside the reasoning block, or 'default' for the built-in list (default: disabled)<br/>(env: LLAMA_ARG_REASONING_PENALTY_WORDS) |
+| `--reasoning-penalty-words-file FNAME` | file to read reasoning penalty words from, one per line ('#' comments and blank lines are ignored, lines starting with '=' are kept as is)<br/>(env: LLAMA_ARG_REASONING_PENALTY_WORDS_FILE) |
+| `--reasoning-penalty-start N` | reasoning penalty at the start of a reasoning block (default: 0.00)<br/>(env: LLAMA_ARG_REASONING_PENALTY_START) |
+| `--reasoning-penalty-step N` | reasoning penalty increase per trigger marker in the reasoning block (default: 0.25)<br/>(env: LLAMA_ARG_REASONING_PENALTY_STEP) |
+| `--reasoning-penalty-max N` | maximum reasoning penalty (default: 3.00)<br/>(env: LLAMA_ARG_REASONING_PENALTY_MAX) |
+| `--reasoning-penalty-window N` | count reasoning penalty triggers only in the last N reasoning tokens, 0 = whole block (default: 0)<br/>(env: LLAMA_ARG_REASONING_PENALTY_WINDOW) |
 
 
 ### Server-specific params
@@ -576,6 +582,15 @@ These words will not be included in the completion, so make sure to add them to 
 
 `logit_bias`: Modify the likelihood of a token appearing in the generated text completion. For example, use `"logit_bias": [[15043,1.0]]` to increase the likelihood of the token 'Hello', or `"logit_bias": [[15043,-1.0]]` to decrease its likelihood. Setting the value to false, `"logit_bias": [[15043,false]]` ensures that the token `Hello` is never produced. The tokens can also be represented as strings, e.g. `[["Hello, World!",-0.5]]` will reduce the likelihood of all the individual tokens that represent the string `Hello, World!`, just like the `presence_penalty` does. For compatibility with the OpenAI API, a JSON object {"<string or token id>": bias, ...} can also be passed. Default: `[]`
 
+`reasoning_penalty`: Subtract a penalty from the logits of overthinking marker words (`Wait`, `But`, `Alternatively`, ...), only while the model is inside its reasoning block. Based on [Lotfi et al.](https://arxiv.org/abs/2606.00206). Object with the fields below; missing fields use the server defaults (`--reasoning-penalty-*`). `null` also means the server default; use `"words": []` to disable it for one request.
+  - `words`: array of words, or `"default"` for the built-in list (write `"reasoning_penalty": {"words": "default"}`; a bare `"reasoning_penalty": "default"` is not an object and is ignored). Each word resolves to up to two tokens: `" " + word` (always penalized) and the bare `word` (penalized only at the start of a line). Spellings that are not a single token are skipped. Case is not folded. An entry starting with `=` is a literal token piece (escapes like `\n` are processed) with no line start rule.
+  - `start`, `step`, `max`: the penalty is `min(max, start + step * n)`, where `n` is the number of trigger markers in the current reasoning block. Triggers are the bare words at line start and the space variants of words that start with an uppercase letter. All markers are penalized, only triggers increase `n`. `start = L, step = 0` gives a fixed penalty `L`. The penalty is applied before temperature.
+  - `window`: if greater than 0, `n` counts only the triggers in the last `window` reasoning tokens. `0` counts the whole block.
+
+  The reasoning block is found with the chat template's thinking tags, so it works with the chat completion endpoints. For `/completion` with a raw prompt, pass `reasoning_budget_start_tag` and `reasoning_budget_end_tags` yourself, otherwise the penalty is not active. Backend sampling is disabled when the penalty is used. The final response contains a `reasoning_penalty` object with the counts `triggers`, `markers`, `tokens_in_think` and the per-token `hits` (`"Wait/line"` is the bare variant at line start). Default: disabled
+
+  The built-in list (`"default"`) is the 50 words from the paper: `perhaps, maybe, wait, Wait, actually, hold, Hmm, hmm, Alternatively, alternatively, However, however, instead, Instead, But, but, though, although, yet, rather, unless, otherwise, nonetheless, nevertheless, regardless, still, anyway, Or, or, either, whether, uncertain, unsure, possibly, might, could, another, different, reconsider, rethink, backtrack, retry, recheck, revisit, doubt, confused, wrong, mistake, error, incorrect`
+
 `n_probs`: If greater than 0, the response also contains the probabilities of top N tokens for each generated token given the sampling settings. Note that for temperature < 0 the tokens are sampled greedily but token probabilities are still being calculated via a simple softmax of the logits without considering any other sampler settings. Default: `0`
 
 `min_keep`: If greater than 0, force samplers to return N possible tokens at minimum. Default: `0`
@@ -669,6 +684,7 @@ These words will not be included in the completion, so make sure to add them to 
   - `word`: Stopped due to encountering a stopping word from `stop` JSON array provided
 - `stopping_word`: The stopping word encountered which stopped the generation (or "" if not stopped due to a stopping word)
 - `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`
+- `reasoning_penalty`: Reasoning penalty counts, only present if the penalty is active (see the `reasoning_penalty` option)
 - `tokens_cached`: Number of tokens from the prompt which could be re-used from previous completion
 - `tokens_evaluated`: Number of tokens evaluated in total from the prompt
 - `truncated`: Boolean indicating if the context size was exceeded during generation, i.e. the number of tokens provided in the prompt (`tokens_evaluated`) plus tokens generated (`tokens predicted`) exceeded the context size (`n_ctx`)
