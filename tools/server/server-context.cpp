@@ -2155,11 +2155,46 @@ private:
                 hits[label] = count;
             }
 
+            // 5 significant digits
+            auto rnd = [](double v) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.5g", v);
+                return std::strtod(buf, nullptr);
+            };
+
+            json p_end = json::object();
+            for (int i = 0; i < COMMON_REASONING_PENALTY_POS_COUNT; i++) {
+                const auto & s = stats.p_end[i];
+                p_end[common_reasoning_penalty_pos_name((common_reasoning_penalty_pos) i)] = json {
+                    {"n",    s.n},
+                    {"mean", rnd(s.n > 0 ? s.sum / s.n : 0.0)},
+                    {"max",  rnd(s.max)},
+                };
+            }
+
+            json p_end_trace = json::array();
+            for (const auto & e : stats.p_end_trace) {
+                p_end_trace.push_back(json::array({ e.tokens_in_think, std::string(1, e.cls), rnd(e.p_end) }));
+            }
+
+            json sent_trace = json::array();
+            for (const auto & e : stats.sent_trace) {
+                sent_trace.push_back(json::array({ e.tokens_in_think, rnd(e.p_single), rnd(e.p_double) }));
+            }
+
             res->reasoning_penalty = json {
                 {"triggers",        stats.triggers},
                 {"markers",         stats.markers},
                 {"tokens_in_think", stats.tokens_in_think},
                 {"hits",            hits},
+                {"p_end",           p_end},
+                {"p_end_trace",     p_end_trace},
+                {"p_nl_at_sent",    {
+                    {"n",           stats.nl_n},
+                    {"mean_single", rnd(stats.nl_n > 0 ? stats.nl_sum_single / stats.nl_n : 0.0)},
+                    {"mean_double", rnd(stats.nl_n > 0 ? stats.nl_sum_double / stats.nl_n : 0.0)},
+                }},
+                {"sent_trace",      sent_trace},
             };
         }
 

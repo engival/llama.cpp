@@ -373,8 +373,12 @@ struct common_sampler * common_sampler_init(
     }
 
     if (use_rpenalty) {
+        // track the probability of the first end tag token
+        const llama_token end_token = params.reasoning_budget_end[0].empty() ? LLAMA_TOKEN_NULL : params.reasoning_budget_end[0][0];
+
         rpenalty = common_reasoning_penalty_init(vocab, std::move(rpenalty_entries),
-                params.reasoning_penalty.start, params.reasoning_penalty.step, params.reasoning_penalty.max, params.reasoning_penalty.window);
+                params.reasoning_penalty.start, params.reasoning_penalty.step, params.reasoning_penalty.max, params.reasoning_penalty.window,
+                end_token);
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)

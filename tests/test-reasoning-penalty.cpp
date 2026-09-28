@@ -270,6 +270,117 @@ static void test_line_start(const llama_vocab * vocab) {
     fprintf(stderr, "  Test 'line start' passed\n");
 }
 
+static void test_tracking(const llama_vocab * vocab) {
+    auto tok = [&](const char * text) {
+        const auto tokens = common_tokenize(vocab, text, false, false);
+        GGML_ASSERT(tokens.size() == 1);
+        return tokens[0];
+    };
+
+    const llama_token end   = tok(" banana");
+    const llama_token nl    = tok("\n");
+    const llama_token nl2   = tok("\n\n");
+    const llama_token dot   = tok(".");
+    const llama_token x     = tok("x");
+    const llama_token word  = tok(" the");
+    const llama_token wait  = tok("Wait");
+    const llama_token swait = tok(" Wait");
+
+    // penalty 0/0/0: tracking only
+    auto * smpl = common_reasoning_penalty_init(vocab, common_reasoning_penalty_resolve(vocab, { "Wait" }, nullptr), 0.0f, 0.0f, 0.0f, 0, end);
+
+    // large offset to check the logsumexp, one masked token
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const float   base    = 1000.0f;
+    std::vector<llama_token_data> cur;
+    auto apply = [&]() {
+        cur.clear();
+        for (llama_token i = 0; i < n_vocab; i++) {
+            cur.push_back({ i, base, 0.0f });
+        }
+        cur[end].logit  = base + 2.0f;
+        cur[nl].logit   = base + 1.0f;
+        cur[nl2].logit  = base + 3.0f;
+        cur[x].logit    = -INFINITY;
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(smpl, &cur_p);
+    };
+
+    // expected probabilities
+    const double z        = (n_vocab - 4) + std::exp(2.0) + std::exp(1.0) + std::exp(3.0);
+    const float  p_end    = (float) (std::exp(2.0) / z);
+    const float  p_single = (float) (std::exp(1.0) / z);
+    const float  p_double = (float) (std::exp(3.0) / z);
+    auto near = [](float a, float b) { return std::fabs(a - b) <= 1e-4f * b; };
+
+    // first token of the block: para, logits untouched
+    apply();
+    GGML_ASSERT(cur[end].logit == base + 2.0f && cur[wait].logit == base && cur[swait].logit == base);
+    GGML_ASSERT(common_reasoning_penalty_get_stats(smpl).p_end[COMMON_REASONING_PENALTY_POS_PARA].n == 0); // not committed before accept
+    llama_sampler_accept(smpl, word);
+    auto st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_PARA].n == 1);
+    GGML_ASSERT(near((float) st.p_end[COMMON_REASONING_PENALTY_POS_PARA].sum, p_end));
+    GGML_ASSERT(near(st.p_end[COMMON_REASONING_PENALTY_POS_PARA].max, p_end));
+    GGML_ASSERT(st.p_end_trace.size() == 1 && st.p_end_trace[0].tokens_in_think == 0 && st.p_end_trace[0].cls == 'p');
+
+    // after " the": mid
+    apply();
+    llama_sampler_accept(smpl, dot);
+    st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_MID].n == 1 && st.p_end_trace.size() == 1);
+
+    // after ".": sent, "\n" / "\n\n" probabilities
+    apply();
+    llama_sampler_accept(smpl, nl);
+    st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_SENT].n == 1);
+    GGML_ASSERT(st.nl_n == 1 && near((float) st.nl_sum_single, p_single) && near((float) st.nl_sum_double, p_double));
+    GGML_ASSERT(st.sent_trace.size() == 1 && st.sent_trace[0].tokens_in_think == 2);
+
+    // after "\n": line, marker at line start counted, no logit change
+    apply();
+    GGML_ASSERT(cur[wait].logit == base);
+    llama_sampler_accept(smpl, wait);
+    st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_LINE].n == 1 && st.markers == 1 && st.triggers == 1);
+    GGML_ASSERT(st.p_end_trace.size() == 2 && st.p_end_trace[1].cls == 'l' && st.p_end_trace[1].tokens_in_think == 3);
+
+    // apply without accept (rejected draft) does not count, a later accept without apply does not count either
+    llama_sampler * saved = llama_sampler_clone(smpl);
+    apply();
+    llama_sampler_copy(saved, smpl);
+    llama_sampler_accept(smpl, nl2);
+    st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_MID].n == 1 && st.p_end[COMMON_REASONING_PENALTY_POS_LINE].n == 1 && st.tokens_in_think == 5);
+
+    apply();
+    common_reasoning_penalty_new_block(smpl); // drops the pending position
+    llama_sampler_accept(smpl, x);
+    st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_PARA].n == 1 && st.tokens_in_think == 6);
+
+    // after "x": mid, then "\n" then "\n" makes a paragraph break
+    llama_sampler_accept(smpl, nl);
+    llama_sampler_accept(smpl, nl);
+    apply();
+    llama_sampler_accept(smpl, word);
+    st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_PARA].n == 2 && st.p_end_trace.back().cls == 'p');
+
+    // after "\n\n": para
+    llama_sampler_accept(smpl, nl2);
+    apply();
+    llama_sampler_accept(smpl, word);
+    st = common_reasoning_penalty_get_stats(smpl);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_PARA].n == 3);
+    GGML_ASSERT(st.p_end[COMMON_REASONING_PENALTY_POS_LINE].n == 1 && st.p_end[COMMON_REASONING_PENALTY_POS_SENT].n == 1);
+
+    llama_sampler_free(saved);
+    llama_sampler_free(smpl);
+    fprintf(stderr, "  Test 'tracking' passed\n");
+}
+
 static void test_gating(const llama_model * model) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -283,6 +394,20 @@ static void test_gating(const llama_model * model) {
     {
         common_sampler_ptr gsmpl(common_sampler_init(model, params));
         GGML_ASSERT(common_sampler_get_reasoning_penalty(gsmpl.get()) == nullptr);
+    }
+
+    // penalty 0/0/0: the sampler exists, for tracking only
+    {
+        common_params_sampling p0;
+        p0.reasoning_budget_start  = { tag_start };
+        p0.reasoning_budget_end    = { { tag_end } };
+        p0.reasoning_penalty.words = common_reasoning_penalty_default_words();
+        p0.reasoning_penalty.start = 0.0f;
+        p0.reasoning_penalty.step  = 0.0f;
+        p0.reasoning_penalty.max   = 0.0f;
+
+        common_sampler_ptr gsmpl(common_sampler_init(model, p0));
+        GGML_ASSERT(common_sampler_get_reasoning_penalty(gsmpl.get()) != nullptr);
     }
 
     params.reasoning_budget_start = { tag_start };
@@ -368,6 +493,7 @@ int main(int argc, char ** argv) {
     test_resolve(vocab);
     test_line_start(vocab);
     test_clone_copy(vocab);
+    test_tracking(vocab);
     test_gating(model);
 
     llama_model_free(model);
