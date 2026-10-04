@@ -3702,12 +3702,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             // Intel Xe regresses at SIMD32 for this scan; prefer a narrower subgroup.
             uint32_t gdn_subgroup_size = device->subgroup_size;
-            if (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control &&
+            if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture != INTEL_XE2 && device->subgroup_size_control &&
                 device->subgroup_min_size <= 16u && device->subgroup_max_size >= 16u) {
                 gdn_subgroup_size = 16u;
             }
             uint32_t lanes_per_column;
-            if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+            if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE2) {
+                // Xe2: SIMD32 with 2 columns per subgroup beats SIMD16 by ~2.7x on long scans, same on decode.
+                lanes_per_column = std::min(16u, S_V);
+            } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
                 // Intel Xe: full-width reduction (min rows/lane) ~10x over the COLS_PER_WG=8 rule.
                 lanes_per_column = std::min(gdn_subgroup_size, S_V);
             } else if (S_V >= 128u && device->subgroup_clustered) {
