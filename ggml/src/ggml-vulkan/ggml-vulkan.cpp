@@ -1311,6 +1311,34 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
+    // LOCAL TUNING SCAFFOLD (not for upstream): GGML_VK_FA_TUNE="num_subgroups,shmem_staging,d_split,subgroup_size",
+    // empty field = default. Br stays 16: the cm1 shader holds one MatBr-row accumulator per subgroup.
+    if (const char * tune = getenv("GGML_VK_FA_TUNE")) {
+        uint32_t v[4] = { num_subgroups, result.shmem_staging, result.d_split, result.subgroup_size };
+        const char * s = tune;
+        for (int i = 0; i < 4 && *s; i++) {
+            if (*s != ',') {
+                v[i] = (uint32_t) strtoul(s, nullptr, 10);
+            }
+            s = strchr(s, ',');
+            if (!s) {
+                break;
+            }
+            s++;
+        }
+        if (v[0] == 0 || v[0] > 16 || (v[0] & (v[0] - 1)) || v[2] == 0 || (D_lsb / 4) % v[2] != 0 ||
+            v[3] < device->subgroup_min_size || v[3] > device->subgroup_max_size || v[2] > v[3]) {
+            GGML_ABORT("GGML_VK_FA_TUNE=%s: num_subgroups a power of two <= 16, d_split must divide %u, subgroup_size in [%u, %u]",
+                       tune, D_lsb / 4, device->subgroup_min_size, device->subgroup_max_size);
+        }
+        result.subgroup_size  = v[3];
+        result.block_cols     = coopmat_block_cols * v[0];
+        result.row_split      = v[0];
+        result.workgroup_size = v[0] * result.subgroup_size;
+        result.shmem_staging  = v[1] ? 1 : 0;
+        result.d_split        = v[2];
+    }
+
     return result;
 }
 
