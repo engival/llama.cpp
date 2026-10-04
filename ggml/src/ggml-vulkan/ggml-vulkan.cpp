@@ -1298,6 +1298,12 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+    // RDNA3 WMMA is native wave32; RADV defaults compute to wave64. Wave32 is ~1.25x on
+    // multi-row FA on a 7900 XTX (1.39x best, 0.84x worst: hsk=256 with a 16x GQA ratio at nb=512).
+    if (device->architecture == vk_device_architecture::AMD_RDNA3 && device->subgroup_size_control &&
+        device->subgroup_min_size <= 32) {
+        result.subgroup_size = 32;
+    }
     result.workgroup_size = num_subgroups * result.subgroup_size;
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
