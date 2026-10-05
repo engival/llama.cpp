@@ -675,6 +675,9 @@ void main() {
                     }
                     subgroupBarrier();
                 }
+                if (V_PRE_T) {
+                    continue;
+                }
                 // Intel V_TRANSPOSE: a task is 4 kv rows x one vec4 of d, held in registers so the
                 // next chunk's loads are in flight while this chunk multiplies.
                 FLOAT_TYPEV4 vr[vt_k][4];
@@ -706,11 +709,7 @@ void main() {
 
                     if (SHMEM_STAGING == 0) {
 #if !defined(BFLOAT16)
-                    if (V_PRE_T) {
-                        // Column d of the B tile is V^T row d: the kv values are contiguous.
-                        const uint vt_offset = v_offset / 4 + (hsv_offset * v_stride + j * Bc + bc_chunk * MatK) / 4;
-                        coopMatLoad(QMat, data_vv4, vt_offset, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
-                    } else if (v_transpose) {
+                    if (v_transpose) {
                         // V is kv x d row-major, but the B operand wants each column's kv values
                         // contiguous. Load the MatK x MatBr tile with wide loads, store it transposed
                         // into this subgroup's pvsh columns, then load it column-major.
@@ -818,6 +817,29 @@ void main() {
                     if (hsv_col >= hsv_base && hsv_col < hsv_base + hsv_per_tile && hsv_col < HSV) {
                         const uint local_hsv = (hsv_col - hsv_base) / 4;
                         Of[r][d_local] += pvsh[row * osh_stride + local_hsv];
+                    }
+                }
+            }
+        }
+
+        if (V_PRE_T) {
+            // KV chunk outer, hsv tiles inner: each P tile is loaded once for all of them.
+            [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatK; ++bc_chunk) {
+                coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, MatK, gl_MatrixUseA> PMat[q_tiles];
+                [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+                    const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * MatBr;
+                    if (hsv_offset < HSV_pad) {
+                        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatK, MatBr, gl_MatrixUseB> VMat;
+                        coopMatLoad(VMat, data_vv4, v_offset / 4 + (hsv_offset * v_stride + j * Bc + bc_chunk * MatK) / 4,
+                                    v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                        if (hsv_tile == 0) {
+                            [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
+                                coopMatLoad(PMat[qt], Psh, qt * MatBc * psh_stride + bc_chunk * MatK / 4, psh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                            }
+                        }
+                        [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
+                            PVacc[hsv_tile * q_tiles + qt] = coopMatMulAdd(PMat[qt], VMat, PVacc[hsv_tile * q_tiles + qt]);
+                        }
                     }
                 }
             }
