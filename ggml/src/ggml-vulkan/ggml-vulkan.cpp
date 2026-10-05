@@ -1328,6 +1328,10 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
         result.v_transpose = device->driver_id == vk::DriverId::eMesaRadv ? 2 : 1;
     }
+    // Intel lowers a row-major B load to one 16-bit load per element, so V is staged transposed too.
+    if (result.coopmat_m == 8) {
+        result.v_transpose = 1;
+    }
 
     // LOCAL TUNING SCAFFOLD (not for upstream): GGML_VK_FA_TUNE="num_subgroups,shmem_staging,d_split,subgroup_size,v_transpose",
     // empty field = default. Br stays 16: the cm1 shader holds one MatBr-row accumulator per subgroup.

@@ -65,13 +65,14 @@ const uint32_t D_pad = HSK_pad > HSV_pad ? HSK_pad : HSV_pad;
 const uint32_t kvsh_stride = (SHMEM_STAGING != 0 ? D_pad : MatK) / 4 + 2;
 const uint v_cols = MatBr / 4 * row_split; // total cols, 4 vec4s per MatBr * number of subgroups
 const uint vsh_stride = v_cols;
-// With P_ROW_MAJOR, aligned f16 V is staged transposed ([d][kv]) per hsv tile instead, so the
-// B operand loads column-major: Intel lowers a row-major B load to one 16-bit load per element.
-const uint vt_stride = Bc / 4 + 2;
-const uint kvsh_size = (kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride);
-// (16 / MatBc - 1) is P_ROW_MAJOR as an integer: glslang emits invalid SPIR-V for && here.
-const uint vt_size = MatBr * row_split * vt_stride * (16 / MatBc - 1);
-shared FLOAT_TYPEV4 kvsh[vt_size > kvsh_size ? vt_size : kvsh_size];
+// Size kvsh for the staging this pipeline can actually do; the rest load straight from global
+// memory (or, with V_TRANSPOSE, through pvsh). Shared memory limits occupancy on Intel.
+// Integer sums, not && / ||: glslang emits invalid SPIR-V for those in a spec-constant array size.
+const uint kvsh_need_k = (FaTypeK != GGML_TYPE_F16 ? 1 : 0) + Clamp + (Flags & 16) + HSK % 16 + SHMEM_STAGING;
+const uint kvsh_need_v = (FaTypeV != GGML_TYPE_F16 ? 1 : 0) + Clamp + (Flags & 16) + SHMEM_STAGING;
+const uint kvsh_k = kvsh_need_k > 0 ? Bc * kvsh_stride : 1;
+const uint kvsh_v = kvsh_need_v > 0 ? Bc * (SHMEM_STAGING != 0 ? kvsh_stride : vsh_stride) : 1;
+shared FLOAT_TYPEV4 kvsh[kvsh_k >= kvsh_v ? kvsh_k : kvsh_v];
 
 // With V_TRANSPOSE, pvsh doubles as each subgroup's transposed V staging tile (columns
 // [gl_SubgroupID * MatBr, +MatBr) of every row). V_TRANSPOSE 1 pads two vec4, keeping the row
@@ -79,6 +80,8 @@ shared FLOAT_TYPEV4 kvsh[vt_size > kvsh_size ? vt_size : kvsh_size];
 // bank conflicts but is only 8-byte aligned (the host picks it on RADV only).
 const uint32_t osh_pad = V_TRANSPOSE == 2 ? 1 : V_TRANSPOSE != 0 ? 2 : 0;
 const uint32_t osh_stride = row_split * MatBr / 4 + osh_pad;
+const uint vt_tasks4 = MatK / 4 * MatBr / 4;                   // Intel V_TRANSPOSE tasks per chunk
+const uint vt_k = (vt_tasks4 + SubGroupSize - 1) / SubGroupSize; // ... per invocation
 shared O_TYPEV4 pvsh[MatBr * osh_stride];
 
 shared ACC_TYPE slope[Br];
@@ -176,12 +179,6 @@ void main() {
         }
     }
 #endif
-    bool vt_stage = false;
-    if (P_ROW_MAJOR && V_TRANSPOSE == 0 && SHMEM_STAGING == 0) {
-        if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
-            vt_stage = true;
-        }
-    }
 
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
@@ -549,32 +546,28 @@ void main() {
                     }
                 }
             }
-            if (vt_stage) {
-                // A task turns 8 KV rows x 4 d into 4 transposed rows of 8 KV.
-                [[unroll]] for (uint32_t t0 = 0; t0 < Bc / 8 * v_cols; t0 += gl_WorkGroupSize.x) {
-                    const uint t = t0 + tid;
-                    if (t < Bc / 8 * v_cols) {
-                        const uint dv = t % v_cols;
-                        const uint kb = t / v_cols;
-                        const uint d = hsv_tile * MatBr * row_split + dv * 4;
-                        FLOAT_TYPEV4 vr[8];
-                        [[unroll]] for (uint32_t r = 0; r < 8; ++r) {
-                            vr[r] = d < HSV ? FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + kb * 8 + r) * v_stride / 4 + d / 4]) : FLOAT_TYPEV4(0.0f);
-                        }
-                        [[unroll]] for (uint32_t e = 0; e < 4; ++e) {
-                            const uint o = (dv * 4 + e) * vt_stride + kb * 2;
-                            kvsh[o]     = FLOAT_TYPEV4(vr[0][e], vr[1][e], vr[2][e], vr[3][e]);
-                            kvsh[o + 1] = FLOAT_TYPEV4(vr[4][e], vr[5][e], vr[6][e], vr[7][e]);
-                        }
-                    }
-                }
-            }
             }
             barrier();
 
             const uint o_offset = gl_SubgroupID * MatBr / 4;
 
             if (hsv_offset < HSV_pad) {
+                // Intel V_TRANSPOSE: a task is 4 kv rows x one vec4 of d, held in registers so the
+                // next chunk's loads are in flight while this chunk multiplies.
+                FLOAT_TYPEV4 vr[vt_k][4];
+#define LOAD_VT(chunk) \
+    [[unroll]] for (uint32_t k = 0; k < vt_k; ++k) { \
+        const uint t = k * gl_SubgroupSize + gl_SubgroupInvocationID; \
+        if (t < vt_tasks4) { \
+            const uint vrow = v_offset / 4 + (j * Bc + (chunk) * MatK + 4 * (t / (MatBr / 4))) * v_stride / 4 + hsv_offset / 4 + t % (MatBr / 4); \
+            [[unroll]] for (uint32_t r = 0; r < 4; ++r) { \
+                vr[k][r] = data_vv4[vrow + r * v_stride / 4]; \
+            } \
+        } \
+    }
+                if (v_transpose && P_ROW_MAJOR) {
+                    LOAD_VT(0)
+                }
                 // P rows of query tile qt, columns of this KV chunk
 #define LOAD_P(qt) \
     if (P_ROW_MAJOR) { \
@@ -603,6 +596,22 @@ void main() {
                         if (bc_chunk > 0) {
                             subgroupBarrier();
                         }
+                        if (P_ROW_MAJOR) {
+                            // Intel lowers 16-bit shared stores one element at a time: store one
+                            // transposed vec4 (4 kv) per d column, then start the next chunk's loads.
+                            [[unroll]] for (uint32_t k = 0; k < vt_k; ++k) {
+                                const uint t = k * gl_SubgroupSize + gl_SubgroupInvocationID;
+                                if (t < vt_tasks4) {
+                                    [[unroll]] for (uint32_t e = 0; e < 4; ++e) {
+                                        pvsh[(t % (MatBr / 4) * 4 + e) * osh_stride + o_offset + t / (MatBr / 4)] =
+                                            O_TYPEV4(vr[k][0][e], vr[k][1][e], vr[k][2][e], vr[k][3][e]);
+                                    }
+                                }
+                            }
+                            if (bc_chunk + 1 < Bc / MatK) {
+                                LOAD_VT(bc_chunk + 1)
+                            }
+                        } else
                         [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
                             const uint t = k * gl_SubgroupSize + gl_SubgroupInvocationID;
                             if (k * gl_SubgroupSize < vt_tasks && t < vt_tasks) {
@@ -622,9 +631,7 @@ void main() {
                         coopMatLoad(QMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutColumnMajor);
                     } else
 #endif
-                    if (vt_stage) {
-                        coopMatLoad(QMat, kvsh, gl_SubgroupID * MatBr * vt_stride + bc_chunk * MatK / 4, vt_stride, gl_CooperativeMatrixLayoutColumnMajor);
-                    } else if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
+                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatK;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
