@@ -1016,6 +1016,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
+    // {HSV, gqa_ratio, tokens, keys per workgroup}: decode phase 2 split over the KV + split_k_reduce
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, vk_pipeline> pipeline_xe_fa_decode_ph2_split;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, vk_pipeline> pipeline_xe_fa_prefill;
     vk_pipeline pipeline_count_experts;
 

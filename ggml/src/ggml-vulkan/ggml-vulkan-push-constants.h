@@ -142,6 +142,7 @@ struct vk_fa_xe_opt_push_constants {
     uint32_t batch_stride_m;
     uint32_t batch_stride_o;
     float softmax_scale;
+    uint32_t kv_splits;   // decode phase 2 split over the KV: workgroups per kv head
 };
 
 struct vk_op_push_constants {

@@ -1,0 +1,153 @@
+#version 450
+
+// Phase 2 of the Xe decode flash attention, O = P * V, split over the KV.
+// Phase 1 left P = exp(s - m_chunk) per 32-key chunk (f16) and m_chunk per chunk, for each
+// (token, q head) row. Each workgroup takes CHUNK keys of one kv head, rescales its P to each
+// row's global max, and streams whole V rows (one f16vec4 per thread) into all
+// N_TOK * GQA_RATIO rows at once. Every split uses the same global max, so
+// flash_attn_split_k_reduce only has to add the partials.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer P {float16_t pState[];};
+layout (binding = 1) readonly buffer V_VEC4 {f16vec4 vStateVec4[];};
+layout (binding = 2) readonly buffer MAX_FP32 {float max_f32[];};
+layout (binding = 3) writeonly buffer OUT_FP32 {float out_f32[];};
+layout (binding = 3) writeonly buffer OUT_VEC4 {vec4 out_f32_vec4[];};
+
+layout (push_constant) uniform parameter
+{
+  uint kvSeqLen;
+  uint activationLength;
+  uint qHead;
+  uint kvHead;
+  uint qkRatio;
+  uint qkSubGroups;
+  uint flag;
+  uint kStrideTok;
+  uint kStrideHead;
+  uint vStrideTok;
+  uint vStrideHead;
+  uint batchStrideQ;
+  uint batchStrideK;
+  uint batchStrideV;
+  uint batchStrideM;
+  uint batchStrideO;
+  float softMaxScale;
+  uint kvSplits;
+} p;
+
+layout (constant_id = 0) const uint GROUPSIZE = 256;
+layout (constant_id = 1) const uint GQA_RATIO = 2;
+layout (constant_id = 2) const uint HEAD_DIM = 128;
+layout (constant_id = 3) const uint CHUNK = 512;
+layout (constant_id = 4) const uint N_TOK = 1;
+
+#define MATP_REDUCE 32
+#define ROWS (N_TOK * GQA_RATIO)
+#define ROW_THREADS (HEAD_DIM / 4)
+#define KEY_LANES (GROUPSIZE / ROW_THREADS)
+
+shared float sh_gmax[ROWS];
+shared float sh_p[ROWS * CHUNK];
+shared vec4 sh_o[ROWS * ROW_THREADS];
+
+void main() {
+  const uint split = gl_WorkGroupID.x;
+  const uint kvh = gl_WorkGroupID.y;
+  const uint d = gl_WorkGroupID.z;
+  const uint tid = gl_LocalInvocationID.x;
+  const uint col = tid % ROW_THREADS;
+  const uint keyLane = tid / ROW_THREADS;
+  const uint maxDim = (p.kvSeqLen + MATP_REDUCE - 1) / MATP_REDUCE;
+  const uint pDim = maxDim * MATP_REDUCE;
+  const uint keyBegin = split * CHUNK;
+  const uint keyCount = min(p.kvSeqLen - keyBegin, CHUNK);
+  const float fp32Min = uintBitsToFloat(0xFEFFFFFF);
+
+  // row j = (token j / GQA_RATIO, q head kvh * GQA_RATIO + j % GQA_RATIO); phase 1's row index
+  #define P_ROW(j) ((d * N_TOK + (j) / GQA_RATIO) * p.qHead + kvh * GQA_RATIO + (j) % GQA_RATIO)
+
+  // global max of each row over phase 1's chunk maxima, one subgroup per row
+  for (uint j = gl_SubgroupID; j < ROWS; j += gl_NumSubgroups) {
+    float m = fp32Min;
+    for (uint i = gl_SubgroupInvocationID; i < maxDim; i += gl_SubgroupSize) {
+      m = max(m, max_f32[P_ROW(j) * maxDim + i]);
+    }
+    m = subgroupMax(m);
+    if (subgroupElect()) {
+      sh_gmax[j] = m;
+    }
+  }
+  barrier();
+
+  // this split's P, rescaled from its chunk max to the global max
+  for (uint i = tid; i < ROWS * CHUNK; i += GROUPSIZE) {
+    const uint j = i / CHUNK;
+    const uint kk = i % CHUNK;
+    float pv = 0.0f;
+    if (kk < keyCount) {
+      const uint key = keyBegin + kk;
+      pv = float(pState[P_ROW(j) * pDim + key]) * exp(max_f32[P_ROW(j) * maxDim + key / MATP_REDUCE] - sh_gmax[j]);
+    }
+    sh_p[i] = pv;
+  }
+  barrier();
+
+  vec4 acc[ROWS];
+  [[unroll]] for (uint j = 0; j < ROWS; j++) {
+    acc[j] = vec4(0.0f);
+  }
+
+  const uint vBase = (d * p.batchStrideV + kvh * p.vStrideHead) / 4 + col;
+  const uint vStride = p.vStrideTok / 4;
+  [[unroll]] for (uint it = 0; it < CHUNK / KEY_LANES; it++) {
+    const uint kk = it * KEY_LANES + keyLane;
+    if (kk < keyCount) {
+      const vec4 vf = vec4(vStateVec4[vBase + (keyBegin + kk) * vStride]);
+      [[unroll]] for (uint j = 0; j < ROWS; j++) {
+        acc[j] += sh_p[j * CHUNK + kk] * vf;
+      }
+    }
+  }
+
+  // add the key lanes one at a time into a single [ROWS, HEAD_DIM] tile
+  [[unroll]] for (uint kl = 0; kl < KEY_LANES; kl++) {
+    if (keyLane == kl) {
+      [[unroll]] for (uint j = 0; j < ROWS; j++) {
+        sh_o[j * ROW_THREADS + col] = kl == 0 ? acc[j] : sh_o[j * ROW_THREADS + col] + acc[j];
+      }
+    }
+    barrier();
+  }
+
+  // partials in flash_attn_split_k_reduce's layout: O [HEAD_DIM, qHead, kvSplits, tokens, batch],
+  // then [L, M] rows of qHead per (split, token, batch)
+  for (uint i = tid; i < ROWS * ROW_THREADS; i += GROUPSIZE) {
+    const uint j = i / ROW_THREADS;
+    const uint t = j / GQA_RATIO;
+    const uint oRow = HEAD_DIM * p.qHead * (split + p.kvSplits * (t + N_TOK * d)) + HEAD_DIM * (kvh * GQA_RATIO + j % GQA_RATIO);
+    out_f32_vec4[oRow / 4 + i % ROW_THREADS] = sh_o[i];
+  }
+
+  const uint lmBase = HEAD_DIM * p.qHead * p.kvSplits * N_TOK * gl_NumWorkGroups.z;
+  for (uint j = gl_SubgroupID; j < ROWS; j += gl_NumSubgroups) {
+    float l = 0.0f;
+    for (uint kk = gl_SubgroupInvocationID; kk < CHUNK; kk += gl_SubgroupSize) {
+      l += sh_p[j * CHUNK + kk];
+    }
+    l = subgroupAdd(l);
+    if (subgroupElect()) {
+      const uint t = j / GQA_RATIO;
+      const uint lOffset = lmBase + p.qHead * 2 * (split + p.kvSplits * (t + N_TOK * d)) + kvh * GQA_RATIO + j % GQA_RATIO;
+      out_f32[lOffset] = l;
+      out_f32[lOffset + p.qHead] = sh_gmax[j];
+    }
+  }
+}
