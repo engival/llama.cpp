@@ -86,6 +86,18 @@ shared O_TYPEV4 pvsh[MatBr * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// Intel with mask-opt: mask rows [i * Br + r * 4, +4) at KV column lin, read after K * Q^T
+// rather than cached in registers across it.
+f16vec4 load_mask4(const uint m_offset, const uint lin, const uint r, const bool nem1_bounds_check) {
+    f16vec4 m = f16vec4(0.0);
+    [[unroll]] for (uint32_t e = 0; e < 4; ++e) {
+        if (!nem1_bounds_check || i * Br + r * 4 + e < p.nem1) {
+            m[e] = float16_t(data_m[m_offset + (i * Br + r * 4 + e) * m_stride + lin]);
+        }
+    }
+    return m;
+}
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -179,6 +191,20 @@ void main() {
         }
     }
 #endif
+    // mask-opt already skips all -inf blocks, so the mask need not be read before K * Q^T.
+    bool mask_defer = false;
+    if (P_ROW_MAJOR && MASK_ENABLE) {
+        if (USE_MASK_OPT) {
+            mask_defer = true;
+        }
+    }
+    // Same ifs as v_transpose.
+    bool k_prefetch = false;
+    if (P_ROW_MAJOR && SHMEM_STAGING == 0 && HSK % 16 == 0) {
+        if (!USE_DECODE_K && !KV_bounds_check && !USE_SPARSE) {
+            k_prefetch = true;
+        }
+    }
 
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
@@ -203,7 +229,7 @@ void main() {
                 continue;
             }
             // Only load if the block is not all zeros
-            if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            if (!mask_defer && mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
@@ -308,6 +334,17 @@ void main() {
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, MatK, gl_MatrixUseA> KMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatK, MatBr, gl_MatrixUseB> QMat;
 
+        // Intel: K tiles for the next d step are loaded while this one multiplies.
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, MatK, gl_MatrixUseA> KNext[k_tiles];
+#define LOAD_K_NEXT(dd, t) \
+    coopMatLoad(KNext[t], data_kv4, k_offset / 4 + (j * Bc + gl_SubgroupID * kv_per_subgroup + (t) * MatBc) * k_stride / 4 + (dd) * MatK / 4, \
+                k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+        if (k_prefetch) {
+            [[unroll]] for (uint32_t t = 0; t < k_tiles; ++t) {
+                LOAD_K_NEXT(0, t)
+            }
+        }
+
         [[unroll]] for (uint32_t d = 0; d < HSK_pad / MatK; ++d) {
             // If SHMEM_STAGING is set, a Bc * HSK_pad size tile of K is loaded to shmem
             // If not, K is loaded directly from global memory if aligned, otherwise
@@ -352,7 +389,12 @@ void main() {
                     coopMatLoad(QMat, Qf, d * MatK / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
                 }
                 const uint kv_row = gl_SubgroupID * kv_per_subgroup + t * MatBc;
-                if (SHMEM_STAGING != 0) {
+                if (k_prefetch) {
+                    KMat = KNext[t];
+                    if (d + 1 < HSK_pad / MatK) {
+                        LOAD_K_NEXT(d + 1, t)
+                    }
+                } else if (SHMEM_STAGING != 0) {
                     coopMatLoad(KMat, kvsh, kv_row * kvsh_stride + d * MatK / 4, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                 } else if (stage_k) {
                     coopMatLoad(KMat, kvsh, kv_row * kvsh_stride, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
@@ -392,7 +434,12 @@ void main() {
                 if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                     if (!KV_bounds_check || j * Bc + c < KV) {
                         // Mask nem1 bounds check is handled when loading masks
-                        ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
+                        ACC_TYPEV4 masks;
+                        if (mask_defer) {
+                            masks = ACC_TYPEV4(load_mask4(m_offset, j * Bc + c, r, !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0));
+                        } else {
+                            masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
+                        }
                         ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
                         sfsh[c * sfshstride + r] += slopes * masks;
                     }
