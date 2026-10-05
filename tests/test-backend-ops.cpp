@@ -8135,6 +8135,29 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// yue2 NAR (local): the mask only hides the last kv_pad columns of a cache padded up to 64
+struct test_flash_attn_ext_pad_mask : public test_flash_attn_ext {
+    static constexpr int kv_pad = 33;
+
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",kv_pad=" + std::to_string(kv_pad);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> data(ggml_nelements(m), ggml_fp32_to_fp16(0.0f));
+        for (int64_t r = 0; r < ggml_nrows(m); r++) {
+            for (int64_t c = m->ne[0] - kv_pad; c < m->ne[0]; c++) {
+                data[r * m->ne[0] + c] = ggml_fp32_to_fp16(-INFINITY);
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, ggml_nbytes(m));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11717,6 +11740,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 9408, 3823, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // yue2 NAR runs unmasked unless N needs padding (and then mask-opt skips all but the last block)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 9408, 3823, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext_pad_mask(128, 128, 8, {2, 1}, 9408, 3823, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     for (int64_t kv : { 4096, 16384, 65536 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
