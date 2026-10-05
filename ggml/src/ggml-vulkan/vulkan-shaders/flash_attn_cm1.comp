@@ -348,9 +348,12 @@ void main() {
                 barrier();
             }
 
-            coopMatLoad(QMat, Qf, d * MatK / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
-
+            // Load order matters to both compilers: RADV wants the K load first so its latency
+            // overlaps the Q load, Intel (P_ROW_MAJOR) is ~3% faster with Q first.
             [[unroll]] for (uint32_t t = 0; t < k_tiles; ++t) {
+                if (P_ROW_MAJOR && t == 0) {
+                    coopMatLoad(QMat, Qf, d * MatK / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
+                }
                 const uint kv_row = gl_SubgroupID * kv_per_subgroup + t * MatBc;
                 if (SHMEM_STAGING != 0) {
                     coopMatLoad(KMat, kvsh, kv_row * kvsh_stride + d * MatK / 4, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
@@ -359,6 +362,9 @@ void main() {
                 } else {
                     const uint coord = k_offset / 4 + (j * Bc + kv_row) * k_stride / 4 + d * MatK / 4;
                     coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                if (!P_ROW_MAJOR && t == 0) {
+                    coopMatLoad(QMat, Qf, d * MatK / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
                 }
 
                 SfMat[t] = coopMatMulAdd(KMat, QMat, SfMat[t]);
@@ -569,7 +575,19 @@ void main() {
             const uint o_offset = gl_SubgroupID * MatBr / 4;
 
             if (hsv_offset < HSV_pad) {
+                // P rows of query tile qt, columns of this KV chunk
+#define LOAD_P(qt) \
+    if (P_ROW_MAJOR) { \
+        coopMatLoad(KMat, Psh, (qt) * MatBc * psh_stride + bc_chunk * MatK / 4, psh_stride, gl_CooperativeMatrixLayoutRowMajor); \
+    } else { \
+        coopMatLoad(KMat, Psh, bc_chunk * MatK * psh_stride + (qt) * MatBc / 4, psh_stride, gl_CooperativeMatrixLayoutColumnMajor); \
+    }
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatK; ++bc_chunk) {
+                    // Same story as K/Q: P before V on RADV, V first on Intel.
+                    if (!P_ROW_MAJOR) {
+                        LOAD_P(0)
+                    }
+
                     if (SHMEM_STAGING == 0) {
 #if !defined(BFLOAT16)
                     if (v_transpose) {
@@ -620,12 +638,9 @@ void main() {
                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }
 
-                    // P rows of query tile qt, columns of this KV chunk
                     [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
-                        if (P_ROW_MAJOR) {
-                            coopMatLoad(KMat, Psh, qt * MatBc * psh_stride + bc_chunk * MatK / 4, psh_stride, gl_CooperativeMatrixLayoutRowMajor);
-                        } else {
-                            coopMatLoad(KMat, Psh, bc_chunk * MatK * psh_stride + qt * MatBc / 4, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+                        if (P_ROW_MAJOR || qt > 0) {
+                            LOAD_P(qt)
                         }
                         PVMat[qt] = coopMatMulAdd(KMat, QMat, PVMat[qt]);
                     }
