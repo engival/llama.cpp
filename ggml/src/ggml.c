@@ -6921,10 +6921,18 @@ static void ggml_compute_backward(
             // src0.shape   [n,m,q1,r1]
             // src1.shape   [n,p,qq,rr]
 
+            // with F32 operands the gradients are mul_mats of transposed copies: OUT_PROD is a
+            // naive kernel on GPU backends and needs contiguous operands there (transpose(grad)
+            // is not), so it would fall back to the CPU; quantized src0 keeps OUT_PROD
+            const bool mm_back = src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
+
             if (src0_needs_grads) {
                 GGML_ASSERT(grad->ne[2] == src1->ne[2]);
                 GGML_ASSERT(grad->ne[3] == src1->ne[3]);
-                struct ggml_tensor * tmp =
+                struct ggml_tensor * tmp = mm_back ?
+                    ggml_mul_mat(ctx,                                // [n,m,qq,rr]
+                        ggml_cont(ctx, ggml_transpose(ctx, src1)),   // [p,n,qq,rr]
+                        ggml_cont(ctx, ggml_transpose(ctx, grad))) : // [p,m,qq,rr]
                     ggml_out_prod(ctx, // [n,m,qq,rr]
                         src1,          // [n,p,qq,rr]
                         grad);         // [m,p,qq,rr]
@@ -6943,12 +6951,10 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, tmp);
             }
             if (src1_needs_grads) {
-                ggml_add_or_set(ctx, cgraph, isrc1,
-                        // ggml_mul_mat(ctx,                   // [n,p,qq,rr]
-                        //     ggml_cont(ctx,                  // [m,n,q1,r1]
-                        //         ggml_transpose(ctx, src0)), // [m,n,q1,r1]
-                        //     grad),                          // [m,p,qq,rr]
-
+                ggml_add_or_set(ctx, cgraph, isrc1, mm_back ?
+                        ggml_mul_mat(ctx,                                           // [n,p,qq,rr]
+                            ggml_cont(ctx, ggml_transpose(ctx, src0)),              // [m,n,q1,r1]
+                            ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad)) : // [m,p,qq,rr]
                         // when src0 is bigger than tensor->grad (this is mostly the case in llama),
                         // avoid transpose of src0, rather transpose smaller tensor->grad
                         // and then use ggml_out_prod
