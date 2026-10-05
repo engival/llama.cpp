@@ -5277,6 +5277,140 @@ void server_routes::init_routes() {
             TASK_RESPONSE_TYPE_OAI_CMPL);
     };
 
+    // Hybrid: accept a RAW prompt (like /completions) but emit a parsed
+    // OAI-chat response (tool_calls / reasoning_content, like /v1/chat/completions).
+    // The chat parser/format are derived from the model's own template, so the
+    // caller never has to specify chat_format / chat_parser — it "just works".
+    this->post_completions_parsed = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::vector<raw_buffer> files;
+        json body = json::parse(req.body);
+
+        // Segments mode: the prompt is a concatenation of independently rendered
+        // message arrays — e.g. [shared context, fork] — joined SERVER-side, so
+        // the caller never touches prompt text. Each segment renders through the
+        // model's own template (the same code path as /v1/chat/completions, so a
+        // shared-context segment is byte-identical to the live chat's prompt →
+        // KV-cache prefix hit). All but the last render CLOSED: a sentinel user
+        // turn is appended and the render is cut at that turn's span, keeping a
+        // trailing assistant turn out of the template's prefill mode. The last
+        // segment is the actual chat request — it inherits the top-level body
+        // (sampling, stream, tools), renders with the generation prompt, and its
+        // parse keeps the chat parser, tool grammar and reasoning-budget sampler
+        // in sync with the prompt tail. A final assistant message gets the
+        // standard continue_final_message treatment, so seeded reasoning works
+        // here too. Text-only for now (media spans are not re-indexed).
+        if (body.contains("segments")) {
+            if (body.contains("prompt") || body.contains("prompt_prefill")) {
+                res->error(format_error_response("'segments' cannot be combined with 'prompt' or 'prompt_prefill'", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            json segments = body.at("segments");
+            body.erase("segments");
+            if (!segments.is_array() || segments.empty()) {
+                res->error(format_error_response("'segments' must be a non-empty array", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            for (const auto & seg : segments) {
+                if (!seg.is_object() || !seg.contains("messages")) {
+                    res->error(format_error_response("each segment must be an object with 'messages'", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+            }
+            // BOS is added once at tokenization (add_special) — any BOS text the
+            // template itself emits must not survive past the first segment.
+            std::string bos_piece;
+            if (llama_vocab_bos(ctx_server.vocab) != LLAMA_TOKEN_NULL) {
+                bos_piece = common_token_to_piece(ctx_server.vocab, llama_vocab_bos(ctx_server.vocab), true);
+            }
+            auto strip_bos = [&bos_piece](std::string & s) {
+                if (!bos_piece.empty() && s.compare(0, bos_piece.size(), bos_piece) == 0) {
+                    s.erase(0, bos_piece.size());
+                }
+            };
+            std::string joined;
+            for (size_t i = 0; i + 1 < segments.size(); i++) {
+                json seg_body;
+                seg_body["messages"] = segments[i].at("messages");
+                seg_body["messages"].push_back({{"role", "user"}, {"content", "x"}});  // sentinel
+                seg_body["add_generation_prompt"] = false;
+                if (segments[i].contains("tools"))                seg_body["tools"]                = segments[i].at("tools");
+                if (segments[i].contains("chat_template_kwargs")) seg_body["chat_template_kwargs"] = segments[i].at("chat_template_kwargs");
+                json seg_data = oaicompat_chat_params_parse(seg_body, meta->chat_params, files);
+                std::string prompt = seg_data.at("prompt").get<std::string>();
+                const json spans = json_value(seg_data, "message_spans", json::array());
+                const size_t cut = !spans.empty() && spans.back().at("role") == "user"
+                    ? spans.back().at("pos").get<size_t>() : prompt.size() + 1;
+                if (cut > prompt.size()) {
+                    res->error(format_error_response("template yields no usable message spans; cannot close segment " + std::to_string(i), ERROR_TYPE_NOT_SUPPORTED));
+                    return res;
+                }
+                prompt.resize(cut);  // drop the sentinel turn → every turn closed
+                if (i > 0) {
+                    strip_bos(prompt);
+                }
+                joined += prompt;
+            }
+            body["messages"] = segments.back().at("messages");
+            if (segments.back().contains("tools"))                body["tools"]                = segments.back().at("tools");
+            if (segments.back().contains("chat_template_kwargs")) body["chat_template_kwargs"] = segments.back().at("chat_template_kwargs");
+            json data = oaicompat_chat_params_parse(body, meta->chat_params, files);
+            if (!joined.empty()) {
+                std::string tail = data.at("prompt").get<std::string>();
+                strip_bos(tail);
+                data["prompt"] = joined + tail;
+            }
+            data.erase("message_spans");  // spans index the final segment's render, not the joined prompt
+            return handle_completions_impl(
+                req,
+                SERVER_TASK_TYPE_COMPLETION,
+                data,
+                files,
+                TASK_RESPONSE_TYPE_OAI_CHAT);
+        }
+
+        if (!body.contains("prompt")) {
+            res->error(format_error_response("'prompt' or 'segments' is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        json raw_prompt = body.at("prompt");
+        // Optional assistant-side prefill (the template's GEN opener plus e.g. a
+        // pre-closed think block or seeded reasoning). It is sent to the model as
+        // the prompt tail AND becomes generation_prompt, so the chat parser and
+        // the grammar/reasoning-budget samplers see the same prefix the model
+        // does — mirroring how continue_final_message keeps the two in sync.
+        std::string prefill = json_value(body, "prompt_prefill", std::string());
+        if (!prefill.empty() && !raw_prompt.is_string()) {
+            res->error(format_error_response("'prompt' must be a string when 'prompt_prefill' is used", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        // Reuse the chat endpoint's derivation to populate chat_format / chat_parser /
+        // preserved_tokens / tool grammar from the loaded template. It requires a
+        // messages array and renders a prompt we discard; stub one if absent.
+        if (!body.contains("messages")) {
+            body["messages"] = json::array({ {{"role", "user"}, {"content", ""}} });
+        }
+        json data = oaicompat_chat_params_parse(
+            body,
+            meta->chat_params,
+            files);
+        if (!prefill.empty()) {
+            data["prompt"]            = raw_prompt.get<std::string>() + prefill;
+            data["generation_prompt"] = prefill;
+        } else {
+            // Without a prefill the stub-derived generation_prompt stands in; the
+            // caller's prompt must then end with exactly those bytes.
+            data["prompt"] = raw_prompt;
+        }
+        data.erase("message_spans");       // spans indexed into the discarded prompt
+        return handle_completions_impl(
+            req,
+            SERVER_TASK_TYPE_COMPLETION,
+            data,
+            files,
+            TASK_RESPONSE_TYPE_OAI_CHAT);
+    };
+
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
