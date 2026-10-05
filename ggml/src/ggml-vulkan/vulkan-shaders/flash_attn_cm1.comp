@@ -51,8 +51,11 @@ shared float tmpsh[row_split];
 const uint32_t qstride = HSK_pad / 4 + 2;
 shared FLOAT_TYPEV4 Qf[Br * qstride];
 
-const uint psh_stride = Br / 4 + 2;
-shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
+// P is the A operand of P * V. Intel lowers A loads to dword loads only from row-major memory
+// (query rows, KV contiguous), so with an 8-row coopmat Psh is stored that way.
+const bool P_ROW_MAJOR = MatBc == 8;
+const uint psh_stride = P_ROW_MAJOR ? Bc / 4 + 2 : Br / 4 + 2;
+shared FLOAT_TYPEV4 Psh[P_ROW_MAJOR ? Br * psh_stride : Bc * psh_stride];
 
 // Avoid padding for hsk==256 to make it fit in 48KB shmem.
 const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
@@ -62,7 +65,13 @@ const uint32_t D_pad = HSK_pad > HSV_pad ? HSK_pad : HSV_pad;
 const uint32_t kvsh_stride = (SHMEM_STAGING != 0 ? D_pad : MatK) / 4 + 2;
 const uint v_cols = MatBr / 4 * row_split; // total cols, 4 vec4s per MatBr * number of subgroups
 const uint vsh_stride = v_cols;
-shared FLOAT_TYPEV4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
+// With P_ROW_MAJOR, aligned f16 V is staged transposed ([d][kv]) per hsv tile instead, so the
+// B operand loads column-major: Intel lowers a row-major B load to one 16-bit load per element.
+const uint vt_stride = Bc / 4 + 2;
+const uint kvsh_size = (kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride);
+// (16 / MatBc - 1) is P_ROW_MAJOR as an integer: glslang emits invalid SPIR-V for && here.
+const uint vt_size = MatBr * row_split * vt_stride * (16 / MatBc - 1);
+shared FLOAT_TYPEV4 kvsh[vt_size > kvsh_size ? vt_size : kvsh_size];
 
 // With V_TRANSPOSE, pvsh doubles as each subgroup's transposed V staging tile (columns
 // [gl_SubgroupID * MatBr, +MatBr) of every row). V_TRANSPOSE 1 pads two vec4, keeping the row
@@ -167,6 +176,12 @@ void main() {
         }
     }
 #endif
+    bool vt_stage = false;
+    if (P_ROW_MAJOR && V_TRANSPOSE == 0 && SHMEM_STAGING == 0) {
+        if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
+            vt_stage = true;
+        }
+    }
 
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
@@ -424,14 +439,26 @@ void main() {
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
                 const uint row = tile_row(r);
                 if (KV_bounds_check && j * Bc + col >= KV) {
-                    Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
+                    if (P_ROW_MAJOR) {
+                        [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                            Psh[(row + vec_idx) * psh_stride + col / 4][col % 4] = FLOAT_TYPE(0.0f);
+                        }
+                    } else {
+                        Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
+                    }
                 } else {
                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
                         Lf[r + vec_idx] += Pf[vec_idx];
                     }
-                    Psh[col * psh_stride + row / 4] = Pf;
+                    if (P_ROW_MAJOR) {
+                        [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                            Psh[(row + vec_idx) * psh_stride + col / 4][col % 4] = Pf[vec_idx];
+                        }
+                    } else {
+                        Psh[col * psh_stride + row / 4] = Pf;
+                    }
                 }
             }
         }
@@ -516,6 +543,26 @@ void main() {
                     }
                 }
             }
+            if (vt_stage) {
+                // A task turns 8 KV rows x 4 d into 4 transposed rows of 8 KV.
+                [[unroll]] for (uint32_t t0 = 0; t0 < Bc / 8 * v_cols; t0 += gl_WorkGroupSize.x) {
+                    const uint t = t0 + tid;
+                    if (t < Bc / 8 * v_cols) {
+                        const uint dv = t % v_cols;
+                        const uint kb = t / v_cols;
+                        const uint d = hsv_tile * MatBr * row_split + dv * 4;
+                        FLOAT_TYPEV4 vr[8];
+                        [[unroll]] for (uint32_t r = 0; r < 8; ++r) {
+                            vr[r] = d < HSV ? FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + kb * 8 + r) * v_stride / 4 + d / 4]) : FLOAT_TYPEV4(0.0f);
+                        }
+                        [[unroll]] for (uint32_t e = 0; e < 4; ++e) {
+                            const uint o = (dv * 4 + e) * vt_stride + kb * 2;
+                            kvsh[o]     = FLOAT_TYPEV4(vr[0][e], vr[1][e], vr[2][e], vr[3][e]);
+                            kvsh[o + 1] = FLOAT_TYPEV4(vr[4][e], vr[5][e], vr[6][e], vr[7][e]);
+                        }
+                    }
+                }
+            }
             }
             barrier();
 
@@ -557,7 +604,9 @@ void main() {
                         coopMatLoad(QMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutColumnMajor);
                     } else
 #endif
-                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
+                    if (vt_stage) {
+                        coopMatLoad(QMat, kvsh, gl_SubgroupID * MatBr * vt_stride + bc_chunk * MatK / 4, vt_stride, gl_CooperativeMatrixLayoutColumnMajor);
+                    } else if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatK;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
@@ -573,7 +622,11 @@ void main() {
 
                     // P rows of query tile qt, columns of this KV chunk
                     [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
-                        coopMatLoad(KMat, Psh, bc_chunk * MatK * psh_stride + qt * MatBc / 4, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+                        if (P_ROW_MAJOR) {
+                            coopMatLoad(KMat, Psh, qt * MatBc * psh_stride + bc_chunk * MatK / 4, psh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                        } else {
+                            coopMatLoad(KMat, Psh, bc_chunk * MatK * psh_stride + qt * MatBc / 4, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+                        }
                         PVMat[qt] = coopMatMulAdd(KMat, QMat, PVMat[qt]);
                     }
                 }

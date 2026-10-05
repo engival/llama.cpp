@@ -11715,6 +11715,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // cm1 FA rewrite baselines (local): yue2 NAR exact eval shape, Qwen3.8 prefill
     // (hs 256, 4 kv heads x6 GQA, ubatch 512), hs 64, short KV
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 9408, 3823, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // yue2 NAR runs unmasked unless N needs padding (and then mask-opt skips all but the last block)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 9408, 3823, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     for (int64_t kv : { 4096, 16384, 65536 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
