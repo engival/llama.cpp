@@ -6958,6 +6958,24 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_CONCAT: {
+            // the gradient of each source is the matching slice of grad along dim
+            // (grad can be a permuted view, ggml_view_4d needs a contiguous dim 0)
+            const int32_t dim = ggml_get_op_params_i32(tensor, 0);
+            struct ggml_tensor * grad_c = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+            if (src0_needs_grads) {
+                struct ggml_tensor * grad0 = ggml_view_4d(ctx, grad_c,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad_c->nb[1], grad_c->nb[2], grad_c->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, grad0));
+            }
+            if (src1_needs_grads) {
+                struct ggml_tensor * grad1 = ggml_view_4d(ctx, grad_c,
+                    src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    grad_c->nb[1], grad_c->nb[2], grad_c->nb[3], src0->ne[dim]*grad_c->nb[dim]);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, grad1));
+            }
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
