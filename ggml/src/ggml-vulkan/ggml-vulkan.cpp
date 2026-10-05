@@ -1438,7 +1438,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type,
+                                                  bool use_v_t = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1446,7 +1447,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_sparse        ? 16 : 0);
+                     (use_sparse        ? 16 : 0) |
+                     (use_v_t           ? 32 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -8255,8 +8257,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+    // coopmat1 on Intel (8x16x16): V is the B operand of P * V, which ANV only loads fast from
+    // column-major memory. Every workgroup used to transpose its V tiles through shared memory;
+    // with enough query tiles it pays to transpose V once into prealloc_x instead.
+    const uint64_t v_t_size = (uint64_t)HSV * KV * nev2 * nev3 * sizeof(ggml_fp16_t);
+    bool use_v_t = tuning_params.path == FA_COOPMAT1 && tuning_params.coopmat_m == 8 && tuning_params.v_transpose != 0 &&
+                   !tuning_params.shmem_staging && v->type == GGML_TYPE_F16 && !use_dequant_kv && !use_sparse && aligned &&
+                   N >= 4 * tuning_params.block_rows && v_t_size <= ctx->device->properties.limits.maxStorageBufferRange &&
+                   getenv("GGML_VK_FA_NO_VT") == nullptr;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff, use_v_t);
 
     vk_pipeline pipeline = nullptr;
 
@@ -8366,6 +8376,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     if (xe_fa_opt == true) {
         use_mask_opt = false;
+        use_v_t = false;
+    }
+
+    vk_pipeline pipeline_v_t = ctx->device->pipeline_cpy_transpose_16;
+    if (use_v_t) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_v_t, 1);
+        if (ctx->prealloc_size_x < v_t_size) {
+            ctx->prealloc_size_x = v_t_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -8508,6 +8531,36 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
+    if (use_v_t) {
+        // V^T[i3][i2][d][kv], written as a copy of X[kv][d] (= V) whose dim 1 is innermost.
+        vk_op_unary_push_constants vt_pc{};
+        vt_pc.ne = (uint32_t)(HSV * KV * nev2 * nev3);
+        vt_pc.ne00 = vt_pc.ne10 = KV;
+        vt_pc.ne01 = vt_pc.ne11 = HSV;
+        vt_pc.ne02 = vt_pc.ne12 = (uint32_t)nev2;
+        vt_pc.ne03 = vt_pc.ne13 = (uint32_t)nev3;
+        vt_pc.nb00 = v_stride;
+        vt_pc.nb01 = 1;
+        vt_pc.nb02 = (uint32_t)(nbv2 / sizeof(ggml_fp16_t));
+        vt_pc.nb03 = (uint32_t)(nbv3 / sizeof(ggml_fp16_t));
+        vt_pc.nb10 = 1;
+        vt_pc.nb11 = KV;
+        vt_pc.nb12 = HSV * KV;
+        vt_pc.nb13 = (uint32_t)(HSV * KV * nev2);
+        init_pushconst_fastdiv(vt_pc);
+        const std::array<uint32_t, 3> vt_wg = {
+            std::min(CEIL_DIV(KV, 32u), ctx->device->properties.limits.maxComputeWorkGroupCount[0]),
+            std::min(CEIL_DIV(HSV, 32u), ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+            std::min((uint32_t)(nev2 * nev3), ctx->device->properties.limits.maxComputeWorkGroupCount[2]) };
+        vk_subbuffer v_t_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_x, 0);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_v_t, { v_buf, v_t_buf }, vt_pc, vt_wg);
+        ggml_vk_sync_buffers(ctx, subctx);
+        v_buf = v_t_buf;
+        v_stride = KV;
+        nbv2_eff = HSV * KV * sizeof(ggml_fp16_t);
+        nbv3_eff = (uint32_t)(HSV * KV * nev2 * sizeof(ggml_fp16_t));
+    }
+
     const vk_flash_attn_push_constants pc = { N, KV,
                                               (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3,
                                               (uint32_t)neq2, (uint32_t)neq3,
@@ -8620,7 +8673,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
-    if (use_dequant_kv) {
+    if (use_dequant_kv || use_v_t) {
         ctx->prealloc_x_need_sync = true;
     }
     if (use_mask_opt || use_sparse) {

@@ -182,7 +182,7 @@ void main() {
     // OpSpecConstantOp that references a function-scope OpPhi (invalid SPIR-V).
     bool v_transpose = false;
 #if !defined(BFLOAT16)
-    if (V_TRANSPOSE != 0 && SHMEM_STAGING == 0) {
+    if (V_TRANSPOSE != 0 && SHMEM_STAGING == 0 && !V_PRE_T) {
         if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
             v_transpose = true;
         }
@@ -706,7 +706,11 @@ void main() {
 
                     if (SHMEM_STAGING == 0) {
 #if !defined(BFLOAT16)
-                    if (v_transpose) {
+                    if (V_PRE_T) {
+                        // Column d of the B tile is V^T row d: the kv values are contiguous.
+                        const uint vt_offset = v_offset / 4 + (hsv_offset * v_stride + j * Bc + bc_chunk * MatK) / 4;
+                        coopMatLoad(QMat, data_vv4, vt_offset, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                    } else if (v_transpose) {
                         // V is kv x d row-major, but the B operand wants each column's kv values
                         // contiguous. Load the MatK x MatBr tile with wide loads, store it transposed
                         // into this subgroup's pvsh columns, then load it column-major.
@@ -789,6 +793,10 @@ void main() {
             }
 
             if (O_IN_ACC) {
+                if (stage_v) {
+                    // The next tile restages kvsh.
+                    barrier();
+                }
                 continue;
             }
             barrier();
