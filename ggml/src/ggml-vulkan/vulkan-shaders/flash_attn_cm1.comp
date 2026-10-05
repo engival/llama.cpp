@@ -86,6 +86,15 @@ shared O_TYPEV4 pvsh[MatBr * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+const uint num_hsv_tiles = (HSV + MatBr * row_split - 1) / (MatBr * row_split); // round up
+
+// Intel: O stays in the P * V accumulators across KV blocks rather than going through pvsh into
+// Of every block. M is raised lazily, with headroom, so most blocks need no rescale; when one
+// does, the accumulators make a round trip through pvsh, scaled by eMsh.
+const bool O_IN_ACC = P_ROW_MAJOR;
+shared float eMsh[O_IN_ACC ? Br : 1];
+shared uint rescale_sh[O_IN_ACC ? row_split : 1];
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -201,6 +210,13 @@ void main() {
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
     f16vec4 mask_cache[Bc * Br / 4 / WorkGroupSize];
+
+    // P * V accumulators, q_tiles per hsv tile. Without O_IN_ACC each tile's are zeroed and
+    // folded into Of every block.
+    coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVacc[num_hsv_tiles * q_tiles];
+    [[unroll]] for (uint32_t t = 0; t < PVacc.length(); ++t) {
+        PVacc[t] = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+    }
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
@@ -454,6 +470,7 @@ void main() {
         }
 
         float eMf[rows_per_thread];
+        bool rescale = false;  // O_IN_ACC: M moved for one of this subgroup's rows
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint r_vec  = tile_row(r) / 4;
             const uint r_comp = tile_row(r) % 4;
@@ -474,16 +491,34 @@ void main() {
             // M = max(rowmax, Mold)
             // P = e^(S - M)
             // eM = e^(Mold - M)
-            Mf[r] = max(rowmaxf, Moldf);
+            if (O_IN_ACC) {
+                // Keep M while P stays <= e^-FATTN_KQ_MAX_OFFSET, as above; when it must move,
+                // move it one more offset so the next blocks can keep it.
+                if (rowmaxf > Moldf) {
+                    Mf[r] = rowmaxf + FATTN_KQ_MAX_OFFSET;
+                    rescale = true;
+                }
+            } else {
+                Mf[r] = max(rowmaxf, Moldf);
+            }
             eMf[r] = exp(Moldf - Mf[r]);
 
             Lf[r] = eMf[r]*Lf[r];
+            if (O_IN_ACC && col_tid == 0) {
+                eMsh[tile_row(r)] = eMf[r];
+            }
         }
 
-        [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
-            const uint d_local = d0 / threads_per_rowgroup;
-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Of[r][d_local] = O_TYPE(eMf[r]) * Of[r][d_local];
+        if (O_IN_ACC) {
+            if (gl_SubgroupInvocationID == 0) {
+                rescale_sh[gl_SubgroupID] = rescale ? 1 : 0;
+            }
+        } else {
+            [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
+                const uint d_local = d0 / threads_per_rowgroup;
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    Of[r][d_local] = O_TYPE(eMf[r]) * Of[r][d_local];
+                }
             }
         }
 
@@ -546,15 +581,33 @@ void main() {
         }
         barrier();
 
-        const uint num_hsv_tiles = (HSV + MatBr * row_split - 1) / (MatBr * row_split); // round up
+        uint any_rescale = 0;
+        if (O_IN_ACC) {
+            [[unroll]] for (uint32_t s = 0; s < row_split; ++s) {
+                any_rescale |= rescale_sh[s];
+            }
+        }
+        // Built with ifs, like v_transpose.
+        bool stage_v = false;
+        if (SHMEM_STAGING == 0) {
+            if (USE_DECODE_V || KV_bounds_check || USE_SPARSE) {
+                stage_v = true;
+            }
+        }
+        bool tile_barrier = stage_v;
+        if (!O_IN_ACC) {
+            tile_barrier = true;
+        }
 
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * MatBr;
 
-            coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat[q_tiles];
-            [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
-                PVMat[qt] = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+#define PVMat(qt) PVacc[hsv_tile * q_tiles + (qt)]
+            if (!O_IN_ACC) {
+                [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
+                    PVMat(qt) = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+                }
             }
 
             // Preload V tiles for [Bc, MatBr * num subgroups]
@@ -569,7 +622,6 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check || USE_SPARSE;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -599,11 +651,30 @@ void main() {
                 }
             }
             }
-            barrier();
+            // O_IN_ACC: subgroups only touch their own pvsh columns, so only kvsh staging needs it.
+            if (tile_barrier) {
+                barrier();
+            }
 
             const uint o_offset = gl_SubgroupID * MatBr / 4;
 
             if (hsv_offset < HSV_pad) {
+                if (O_IN_ACC && any_rescale != 0) {
+                    // Scale this subgroup's O columns, all Br rows, by e^(Mold - M) via pvsh.
+                    [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
+                        coopMatStore(PVMat(qt), pvsh, o_offset + qt * MatBc * osh_stride, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    subgroupBarrier();
+                    [[unroll]] for (uint32_t idx = gl_SubgroupInvocationID; idx < Br * MatBr / 4; idx += gl_SubgroupSize) {
+                        const uint row = idx / (MatBr / 4);
+                        pvsh[row * osh_stride + o_offset + idx % (MatBr / 4)] *= O_TYPE(eMsh[row]);
+                    }
+                    subgroupBarrier();
+                    [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
+                        coopMatLoad(PVMat(qt), pvsh, o_offset + qt * MatBc * osh_stride, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    subgroupBarrier();
+                }
                 // Intel V_TRANSPOSE: a task is 4 kv rows x one vec4 of d, held in registers so the
                 // next chunk's loads are in flight while this chunk multiplies.
                 FLOAT_TYPEV4 vr[vt_k][4];
@@ -701,7 +772,7 @@ void main() {
                         if (P_ROW_MAJOR || qt > 0) {
                             LOAD_P(qt)
                         }
-                        PVMat[qt] = coopMatMulAdd(KMat, QMat, PVMat[qt]);
+                        PVMat(qt) = coopMatMulAdd(KMat, QMat, PVMat(qt));
                     }
                 }
 
@@ -709,12 +780,17 @@ void main() {
                     // The last V tile load must finish before PVMat overwrites the region.
                     subgroupBarrier();
                 }
-                // Store PVMat to pvsh and load into Of
-                [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
-                    coopMatStore(PVMat[qt], pvsh, o_offset + qt * MatBc * osh_stride, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                if (!O_IN_ACC) {
+                    // Store PVMat to pvsh and load into Of
+                    [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
+                        coopMatStore(PVMat(qt), pvsh, o_offset + qt * MatBc * osh_stride, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    }
                 }
             }
 
+            if (O_IN_ACC) {
+                continue;
+            }
             barrier();
 
             const uint hsv_per_tile = row_split * MatBr;
@@ -740,6 +816,31 @@ void main() {
         }
 
         barrier();
+    }
+
+    if (O_IN_ACC) {
+        [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+            const uint o_offset = gl_SubgroupID * MatBr / 4;
+            if ((hsv_tile * row_split + gl_SubgroupID) * MatBr < HSV_pad) {
+                [[unroll]] for (uint32_t qt = 0; qt < q_tiles; ++qt) {
+                    coopMatStore(PVacc[hsv_tile * q_tiles + qt], pvsh, o_offset + qt * MatBc * osh_stride, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            barrier();
+
+            const uint hsv_per_tile = row_split * MatBr;
+            const uint hsv_base = hsv_tile * hsv_per_tile;
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                const uint row = tile_row(r);
+                [[unroll]] for (uint32_t d_local = 0; d_local < d_per_thread; ++d_local) {
+                    const uint hsv_col = 4 * (d_local * threads_per_rowgroup + col_tid);
+                    if (hsv_col >= hsv_base && hsv_col < hsv_base + hsv_per_tile && hsv_col < HSV) {
+                        Of[r][d_local] = pvsh[row * osh_stride + (hsv_col - hsv_base) / 4];
+                    }
+                }
+            }
+            barrier();
+        }
     }
 
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
