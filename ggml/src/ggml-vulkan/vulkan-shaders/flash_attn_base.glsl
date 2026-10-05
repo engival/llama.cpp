@@ -22,6 +22,8 @@ layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
 // coopmat1 only: stage aligned f16 V tiles transposed through per-subgroup shared memory.
 // 1 = 16-byte aligned staging rows, 2 = 8-byte aligned (RADV only, see get_fa_tuning_params_coopmat1).
 layout (constant_id = 16) const uint32_t V_TRANSPOSE = 0;
+// coopmat1 only: the M size of the device's MxNxK = Mx16x16 f16 coopmat shape (16, or 8 on Intel Xe2).
+layout (constant_id = 17) const uint32_t COOPMAT_M = 16;
 
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
@@ -29,6 +31,8 @@ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
 const bool USE_SPARSE      = (Flags & 16) != 0;
+// coopmat1 on Intel: binding 2 holds V transposed, [i3][i2][d][kv] with row stride p.nb21.
+const bool V_PRE_T         = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

@@ -1282,7 +1282,6 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     GGML_UNUSED(n_kv);
     GGML_UNUSED(k_type);
     GGML_UNUSED(v_type);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT1;
@@ -1298,6 +1297,14 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+    // Mx16x16 coopmat shape; with M = 8 (Intel Xe2) the shader runs two M tiles per subgroup.
+    const bool cm_16 = f32acc ? device->coopmat_support_16x16x16_f32acc : device->coopmat_support_16x16x16_f16acc;
+    result.coopmat_m = cm_16 ? 16 : 8;
+    // Xe2's 8x16x16 shape is SIMD16: N = 16 lanes.
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control &&
+        device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) {
+        result.subgroup_size = 16;
+    }
     // RDNA3 WMMA is native wave32; RADV defaults compute to wave64. Wave32 is ~1.25x on
     // multi-row FA on a 7900 XTX (1.39x best, 0.84x worst: hsk=256 with a 16x GQA ratio at nb=512).
     if (device->architecture == vk_device_architecture::AMD_RDNA3 && device->subgroup_size_control &&
@@ -1320,6 +1327,10 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     // the FA tests after Mesa upgrades.
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
         result.v_transpose = device->driver_id == vk::DriverId::eMesaRadv ? 2 : 1;
+    }
+    // Intel lowers a row-major B load to one 16-bit load per element, so V is staged transposed too.
+    if (result.coopmat_m == 8) {
+        result.v_transpose = 1;
     }
 
     // LOCAL TUNING SCAFFOLD (not for upstream): GGML_VK_FA_TUNE="num_subgroups,shmem_staging,d_split,subgroup_size,v_transpose",
@@ -1399,8 +1410,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     }
 
     if (path == FA_COOPMAT1) {
-        bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+        bool shape_ok = (f32acc && (device->coopmat_support_16x16x16_f32acc || device->coopmat_support_8x16x16_f32acc)) ||
+                        (!f32acc && (device->coopmat_support_16x16x16_f16acc || device->coopmat_support_8x16x16_f16acc));
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
 
@@ -1427,7 +1438,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type,
+                                                  bool use_v_t = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1435,11 +1447,12 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_sparse        ? 16 : 0);
+                     (use_sparse        ? 16 : 0) |
+                     (use_v_t           ? 32 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.v_transpose, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.v_transpose, params.coopmat_m, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
 }
 
 static uint32_t fa_block_bytes(ggml_type t) {
@@ -1468,6 +1481,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
         /*16 V_TRANSPOSE     */ state.v_transpose,
+        /*17 COOPMAT_M       */ state.coopmat_m,
     };
 }
 
@@ -4777,6 +4791,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f32acc = true;
                         }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f32acc = true;
+                        }
                     } else if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat16 &&
                                (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat16) {
                         // coopmat sizes not set yet
@@ -4791,6 +4808,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         }
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
+                        }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f16acc = true;
                         }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
@@ -8272,8 +8292,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+    // coopmat1 on Intel (8x16x16): V is the B operand of P * V, which ANV only loads fast from
+    // column-major memory. Every workgroup used to transpose its V tiles through shared memory;
+    // with enough query tiles it pays to transpose V once into prealloc_x instead.
+    const uint64_t v_t_size = (uint64_t)HSV * KV * nev2 * nev3 * sizeof(ggml_fp16_t);
+    bool use_v_t = tuning_params.path == FA_COOPMAT1 && tuning_params.coopmat_m == 8 && tuning_params.v_transpose != 0 &&
+                   !tuning_params.shmem_staging && v->type == GGML_TYPE_F16 && !use_dequant_kv && !use_sparse && aligned &&
+                   N >= 4 * tuning_params.block_rows && v_t_size <= ctx->device->properties.limits.maxStorageBufferRange &&
+                   getenv("GGML_VK_FA_NO_VT") == nullptr;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff, use_v_t);
 
     vk_pipeline pipeline = nullptr;
 
@@ -8391,6 +8419,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     if (xe_fa_opt == true) {
         use_mask_opt = false;
+        use_v_t = false;
+    }
+
+    vk_pipeline pipeline_v_t = ctx->device->pipeline_cpy_transpose_16;
+    if (use_v_t) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_v_t, 1);
+        if (ctx->prealloc_size_x < v_t_size) {
+            ctx->prealloc_size_x = v_t_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -8538,6 +8579,36 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
+    if (use_v_t) {
+        // V^T[i3][i2][d][kv], written as a copy of X[kv][d] (= V) whose dim 1 is innermost.
+        vk_op_unary_push_constants vt_pc{};
+        vt_pc.ne = (uint32_t)(HSV * KV * nev2 * nev3);
+        vt_pc.ne00 = vt_pc.ne10 = KV;
+        vt_pc.ne01 = vt_pc.ne11 = HSV;
+        vt_pc.ne02 = vt_pc.ne12 = (uint32_t)nev2;
+        vt_pc.ne03 = vt_pc.ne13 = (uint32_t)nev3;
+        vt_pc.nb00 = v_stride;
+        vt_pc.nb01 = 1;
+        vt_pc.nb02 = (uint32_t)(nbv2 / sizeof(ggml_fp16_t));
+        vt_pc.nb03 = (uint32_t)(nbv3 / sizeof(ggml_fp16_t));
+        vt_pc.nb10 = 1;
+        vt_pc.nb11 = KV;
+        vt_pc.nb12 = HSV * KV;
+        vt_pc.nb13 = (uint32_t)(HSV * KV * nev2);
+        init_pushconst_fastdiv(vt_pc);
+        const std::array<uint32_t, 3> vt_wg = {
+            std::min(CEIL_DIV(KV, 32u), ctx->device->properties.limits.maxComputeWorkGroupCount[0]),
+            std::min(CEIL_DIV(HSV, 32u), ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+            std::min((uint32_t)(nev2 * nev3), ctx->device->properties.limits.maxComputeWorkGroupCount[2]) };
+        vk_subbuffer v_t_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_x, 0);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_v_t, { v_buf, v_t_buf }, vt_pc, vt_wg);
+        ggml_vk_sync_buffers(ctx, subctx);
+        v_buf = v_t_buf;
+        v_stride = KV;
+        nbv2_eff = HSV * KV * sizeof(ggml_fp16_t);
+        nbv3_eff = (uint32_t)(HSV * KV * nev2 * sizeof(ggml_fp16_t));
+    }
+
     const vk_flash_attn_push_constants pc = { N, KV,
                                               (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3,
                                               (uint32_t)neq2, (uint32_t)neq3,
@@ -8658,7 +8729,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
-    if (use_dequant_kv) {
+    if (use_dequant_kv || use_v_t) {
         ctx->prealloc_x_need_sync = true;
     }
     if (use_mask_opt || use_sparse) {
