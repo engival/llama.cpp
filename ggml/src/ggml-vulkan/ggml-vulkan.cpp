@@ -1311,12 +1311,23 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
-    // LOCAL TUNING SCAFFOLD (not for upstream): GGML_VK_FA_TUNE="num_subgroups,shmem_staging,d_split,subgroup_size",
+    // RDNA3 WMMA wants the B operand contiguous along K; V is row-major along d, so a direct
+    // coopMatLoad lowers to one 16-bit load per element. Stage it transposed per subgroup instead.
+    // 1 pads the staging rows by two vec4, keeping the stride 16-byte aligned as coopMatLoad requires.
+    // 2 pads by one vec4: bank-conflict free and ~5% faster, but the stride is only 8-byte aligned
+    // (VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986). LOCAL: only safe because RADV caps LDS
+    // loads at 64 bits (ac_nir_mem_vectorize_callback, ac_nir_lower_mem_access_bit_sizes); re-run
+    // the FA tests after Mesa upgrades.
+    if (device->vendor_id == VK_VENDOR_ID_AMD) {
+        result.v_transpose = device->driver_id == vk::DriverId::eMesaRadv ? 2 : 1;
+    }
+
+    // LOCAL TUNING SCAFFOLD (not for upstream): GGML_VK_FA_TUNE="num_subgroups,shmem_staging,d_split,subgroup_size,v_transpose",
     // empty field = default. Br stays 16: the cm1 shader holds one MatBr-row accumulator per subgroup.
     if (const char * tune = getenv("GGML_VK_FA_TUNE")) {
-        uint32_t v[4] = { num_subgroups, result.shmem_staging, result.d_split, result.subgroup_size };
+        uint32_t v[5] = { num_subgroups, result.shmem_staging, result.d_split, result.subgroup_size, result.v_transpose };
         const char * s = tune;
-        for (int i = 0; i < 4 && *s; i++) {
+        for (int i = 0; i < 5 && *s; i++) {
             if (*s != ',') {
                 v[i] = (uint32_t) strtoul(s, nullptr, 10);
             }
@@ -1327,8 +1338,8 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
             s++;
         }
         if (v[0] == 0 || v[0] > 16 || (v[0] & (v[0] - 1)) || v[2] == 0 || (D_lsb / 4) % v[2] != 0 ||
-            v[3] < device->subgroup_min_size || v[3] > device->subgroup_max_size || v[2] > v[3]) {
-            GGML_ABORT("GGML_VK_FA_TUNE=%s: num_subgroups a power of two <= 16, d_split must divide %u, subgroup_size in [%u, %u]",
+            v[3] < device->subgroup_min_size || v[3] > device->subgroup_max_size || v[2] > v[3] || v[4] > 2) {
+            GGML_ABORT("GGML_VK_FA_TUNE=%s: num_subgroups a power of two <= 16, d_split must divide %u, subgroup_size in [%u, %u], v_transpose 0-2",
                        tune, D_lsb / 4, device->subgroup_min_size, device->subgroup_max_size);
         }
         result.subgroup_size  = v[3];
@@ -1337,6 +1348,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
         result.workgroup_size = v[0] * result.subgroup_size;
         result.shmem_staging  = v[1] ? 1 : 0;
         result.d_split        = v[2];
+        result.v_transpose    = v[4];
     }
 
     return result;
@@ -1427,7 +1439,7 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.v_transpose, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
 }
 
 static uint32_t fa_block_bytes(ggml_type t) {
@@ -1455,6 +1467,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 V_TRANSPOSE     */ state.v_transpose,
     };
 }
 
@@ -8084,7 +8097,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 
     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
-    const uint32_t osh_stride = params.row_split * MatBr / 4;
+    // With v_transpose, pvsh also holds the transposed V tiles and gets one or two vec4 of padding per row.
+    const uint32_t osh_stride = params.row_split * MatBr / 4 + (params.v_transpose == 2 ? 1 : params.v_transpose ? 2 : 0);
     const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
