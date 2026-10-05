@@ -86,18 +86,6 @@ shared O_TYPEV4 pvsh[MatBr * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
-// Intel with mask-opt: mask rows [i * Br + r * 4, +4) at KV column lin, read after K * Q^T
-// rather than cached in registers across it.
-f16vec4 load_mask4(const uint m_offset, const uint lin, const uint r, const bool nem1_bounds_check) {
-    f16vec4 m = f16vec4(0.0);
-    [[unroll]] for (uint32_t e = 0; e < 4; ++e) {
-        if (!nem1_bounds_check || i * Br + r * 4 + e < p.nem1) {
-            m[e] = float16_t(data_m[m_offset + (i * Br + r * 4 + e) * m_stride + lin]);
-        }
-    }
-    return m;
-}
-
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -191,11 +179,14 @@ void main() {
         }
     }
 #endif
-    // mask-opt already skips all -inf blocks, so the mask need not be read before K * Q^T.
-    bool mask_defer = false;
-    if (P_ROW_MAJOR && MASK_ENABLE) {
+    // Intel with mask-opt: a block that needs its mask starts K * Q^T from slope * mask, staged
+    // through sfsh, instead of adding it after (softcap must see S without the mask). Every
+    // instruction in the loop costs, even skipped ones: the mask code after K * Q^T was ~7% at
+    // the NAR shape although mask-opt runs it for one block in 147.
+    bool mask_in_acc = false;
+    if (P_ROW_MAJOR && MASK_ENABLE && !LOGIT_SOFTCAP) {
         if (USE_MASK_OPT) {
-            mask_defer = true;
+            mask_in_acc = true;
         }
     }
     // Same ifs as v_transpose.
@@ -229,7 +220,7 @@ void main() {
                 continue;
             }
             // Only load if the block is not all zeros
-            if (!mask_defer && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            if (!mask_in_acc && mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
@@ -331,6 +322,25 @@ void main() {
         [[unroll]] for (uint32_t t = 0; t < k_tiles; ++t) {
             SfMat[t] = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
         }
+        if (mask_in_acc && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            // The previous block's softmax is done with sfsh; this also orders the slope writes.
+            barrier();
+            // Not unrolled: this runs for few blocks, and the loop's code size costs every block.
+            [[dont_unroll]] for (uint32_t idx = tid; idx < Bc * Br; idx += gl_WorkGroupSize.x) {
+                const uint c = idx % Bc;
+                const uint r = idx / Bc;
+                ACC_TYPE m = ACC_TYPE(0);
+                if ((!KV_bounds_check || j * Bc + c < KV) && (p.gqa_ratio > 1 || i * Br + r < p.nem1)) {
+                    m = slope[r] * ACC_TYPE(data_m[m_offset + (i * Br + r) * m_stride + j * Bc + c]);
+                }
+                sfsh[c * sfshstride + r / 4][r % 4] = m;
+            }
+            barrier();
+            [[unroll]] for (uint32_t t = 0; t < k_tiles; ++t) {
+                const uint coord = (gl_SubgroupID * kv_per_subgroup + t * MatBc) * sfshstride;
+                coopMatLoad(SfMat[t], sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, MatK, gl_MatrixUseA> KMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatK, MatBr, gl_MatrixUseB> QMat;
 
@@ -427,19 +437,14 @@ void main() {
             barrier();
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        if (MASK_ENABLE && !mask_in_acc && mask_opt_bits != MASK_OPT_ALL_ZERO) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t c = (idx + tid) / (Br / 4);
                 uint32_t r = (idx + tid) % (Br / 4);
                 if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                     if (!KV_bounds_check || j * Bc + c < KV) {
                         // Mask nem1 bounds check is handled when loading masks
-                        ACC_TYPEV4 masks;
-                        if (mask_defer) {
-                            masks = ACC_TYPEV4(load_mask4(m_offset, j * Bc + c, r, !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0));
-                        } else {
-                            masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
-                        }
+                        ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
                         ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
                         sfsh[c * sfshstride + r] += slopes * masks;
                     }
