@@ -11293,6 +11293,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // yue2 NAR shape, correctness side (local, not for upstream): aligned and unaligned KV
+    for (int64_t kv : { 1024, 1100 }) {
+        for (ggml_prec prec : { GGML_PREC_F32, GGML_PREC_DEFAULT }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, 333, true, false, 0, 0, prec, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -11831,6 +11838,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // yue2 NAR (local, not for upstream): hs 128, 8 kv heads x2 GQA, non-causal, F16 K/V + mask
+    for (int64_t nb : { 1024, 4109, 7000 }) {
+        for (int64_t kv : { 4096, 10770, 10784, 10816, 11008, 17000 }) {
+            for (ggml_prec prec : { GGML_PREC_F32, GGML_PREC_DEFAULT }) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, nb, true, false, 0, 0, prec, GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        }
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

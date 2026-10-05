@@ -1298,12 +1298,46 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+    // RDNA3 WMMA is native wave32; RADV defaults compute to wave64. Wave32 is ~1.25x on
+    // multi-row FA on a 7900 XTX (1.39x best, 0.84x worst: hsk=256 with a 16x GQA ratio at nb=512).
+    if (device->architecture == vk_device_architecture::AMD_RDNA3 && device->subgroup_size_control &&
+        device->subgroup_min_size <= 32) {
+        result.subgroup_size = 32;
+    }
     result.workgroup_size = num_subgroups * result.subgroup_size;
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+
+    // LOCAL TUNING SCAFFOLD (not for upstream): GGML_VK_FA_TUNE="num_subgroups,shmem_staging,d_split,subgroup_size",
+    // empty field = default. Br stays 16: the cm1 shader holds one MatBr-row accumulator per subgroup.
+    if (const char * tune = getenv("GGML_VK_FA_TUNE")) {
+        uint32_t v[4] = { num_subgroups, result.shmem_staging, result.d_split, result.subgroup_size };
+        const char * s = tune;
+        for (int i = 0; i < 4 && *s; i++) {
+            if (*s != ',') {
+                v[i] = (uint32_t) strtoul(s, nullptr, 10);
+            }
+            s = strchr(s, ',');
+            if (!s) {
+                break;
+            }
+            s++;
+        }
+        if (v[0] == 0 || v[0] > 16 || (v[0] & (v[0] - 1)) || v[2] == 0 || (D_lsb / 4) % v[2] != 0 ||
+            v[3] < device->subgroup_min_size || v[3] > device->subgroup_max_size || v[2] > v[3]) {
+            GGML_ABORT("GGML_VK_FA_TUNE=%s: num_subgroups a power of two <= 16, d_split must divide %u, subgroup_size in [%u, %u]",
+                       tune, D_lsb / 4, device->subgroup_min_size, device->subgroup_max_size);
+        }
+        result.subgroup_size  = v[3];
+        result.block_cols     = coopmat_block_cols * v[0];
+        result.row_split      = v[0];
+        result.workgroup_size = v[0] * result.subgroup_size;
+        result.shmem_staging  = v[1] ? 1 : 0;
+        result.d_split        = v[2];
+    }
 
     return result;
 }
