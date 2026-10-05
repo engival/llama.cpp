@@ -437,7 +437,7 @@ struct vk_fa_pipeline_state {
     uint32_t Br, Bc;
     uint32_t D_split, row_split;
     bool shmem_staging;
-    bool v_transpose;
+    uint32_t v_transpose;
     FaCodePath path;
     uint32_t workgroup_size, subgroup_size;
     bool aligned;
@@ -1368,7 +1368,7 @@ struct vk_fa_tuning_params {
     uint32_t d_split;
     uint32_t row_split;
     bool shmem_staging;
-    bool v_transpose;
+    uint32_t v_transpose;
     bool disable_subgroups;
     uint32_t limit_occupancy_shmem;
 

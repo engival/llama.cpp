@@ -58,9 +58,10 @@ const uint vsh_stride = v_cols;
 shared FLOAT_TYPEV4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
 
 // With V_TRANSPOSE, pvsh doubles as each subgroup's transposed V staging tile (columns
-// [gl_SubgroupID * MatBr, +MatBr) of every row). Two vec4 of padding keep the row stride
-// 16-byte aligned, as coopMatLoad/coopMatStore require.
-const uint32_t osh_pad = V_TRANSPOSE != 0 ? 2 : 0;
+// [gl_SubgroupID * MatBr, +MatBr) of every row). V_TRANSPOSE 1 pads two vec4, keeping the row
+// stride 16-byte aligned as coopMatLoad/coopMatStore require; 2 pads one vec4, which avoids
+// bank conflicts but is only 8-byte aligned (the host picks it on RADV only).
+const uint32_t osh_pad = V_TRANSPOSE == 2 ? 1 : V_TRANSPOSE != 0 ? 2 : 0;
 const uint32_t osh_stride = row_split * MatBr / 4 + osh_pad;
 shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
