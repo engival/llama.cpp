@@ -845,7 +845,11 @@ void main() {
             }
         }
 
-        barrier();
+        // V_PRE_T stages nothing in kvsh, and the next block's first shared writes (sfsh, then
+        // Psh, eMsh, rescale_sh) all come after its K * Q^T barrier.
+        if (!V_PRE_T) {
+            barrier();
+        }
     }
 
     if (O_IN_ACC) {
