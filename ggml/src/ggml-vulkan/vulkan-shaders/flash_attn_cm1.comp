@@ -57,7 +57,11 @@ const uint v_cols = MatBc / 4 * row_split; // total cols, 4 vec4s per MatBc * nu
 const uint vsh_stride = v_cols;
 shared FLOAT_TYPEV4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
 
-const uint32_t osh_stride = row_split * MatBr / 4;
+// With V_TRANSPOSE, pvsh doubles as each subgroup's transposed V staging tile (columns
+// [gl_SubgroupID * MatBr, +MatBr) of every row). Two vec4 of padding keep the row stride
+// 16-byte aligned, as coopMatLoad/coopMatStore require.
+const uint32_t osh_pad = V_TRANSPOSE != 0 ? 2 : 0;
+const uint32_t osh_stride = row_split * MatBr / 4 + osh_pad;
 shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
@@ -144,6 +148,17 @@ void main() {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
     }
+
+    // Built with ifs: folding this into one && chain makes glslang emit an
+    // OpSpecConstantOp that references a function-scope OpPhi (invalid SPIR-V).
+    bool v_transpose = false;
+#if !defined(BFLOAT16)
+    if (V_TRANSPOSE != 0 && SHMEM_STAGING == 0) {
+        if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
+            v_transpose = true;
+        }
+    }
+#endif
 
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
@@ -495,6 +510,39 @@ void main() {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
                     if (SHMEM_STAGING == 0) {
+#if !defined(BFLOAT16)
+                    if (v_transpose) {
+                        // V is kv x d row-major, but the B operand wants each column's kv values
+                        // contiguous. Load the MatBc x 16 tile with wide loads, store it transposed
+                        // into this subgroup's pvsh columns, then load it column-major.
+                        // A task is two adjacent kv rows x one vec4 of d, so each d column gets a
+                        // packed 32-bit store of its (kv, kv + 1) pair. k < 4 covers subgroups
+                        // down to 8 invocations.
+                        const uint v_tile_row = j * Bc + bc_chunk * MatBc;
+                        const uint vt_tasks = MatBc / 2 * MatBr / 4;
+
+                        if (bc_chunk > 0) {
+                            subgroupBarrier();
+                        }
+                        [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                            const uint t = k * gl_SubgroupSize + gl_SubgroupInvocationID;
+                            if (k * gl_SubgroupSize < vt_tasks && t < vt_tasks) {
+                                const uint pr = t % (MatBc / 2);
+                                const uint dv = t / (MatBc / 2);
+                                const uint vrow = v_offset / 4 + (v_tile_row + 2 * pr) * v_stride / 4 + hsv_offset / 4 + dv;
+                                const FLOAT_TYPEV4 v0 = data_vv4[vrow];
+                                const FLOAT_TYPEV4 v1 = data_vv4[vrow + v_stride / 4];
+                                [[unroll]] for (uint32_t e = 0; e < 4; ++e) {
+                                    const uint idx = (dv * 4 + e) * osh_stride + o_offset + pr / 2;
+                                    pvsh[idx][(pr % 2) * 2]     = v0[e];
+                                    pvsh[idx][(pr % 2) * 2 + 1] = v1[e];
+                                }
+                            }
+                        }
+                        subgroupBarrier();
+                        coopMatLoad(QMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+                    } else
+#endif
                     if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
@@ -512,6 +560,10 @@ void main() {
                     PVMat = coopMatMulAdd(KMat, QMat, PVMat);
                 }
 
+                if (v_transpose) {
+                    // The last V tile load must finish before PVMat overwrites the region.
+                    subgroupBarrier();
+                }
                 // Store PVMat to pvsh and load into Of
                 coopMatStore(PVMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
             }
