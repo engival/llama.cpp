@@ -438,6 +438,7 @@ struct vk_fa_pipeline_state {
     uint32_t D_split, row_split;
     bool shmem_staging;
     uint32_t v_transpose;
+    uint32_t coopmat_m;
     FaCodePath path;
     uint32_t workgroup_size, subgroup_size;
     bool aligned;
@@ -448,8 +449,8 @@ struct vk_fa_pipeline_state {
     ggml_type v_type;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, v_transpose, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.v_transpose, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, v_transpose, coopmat_m, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.v_transpose, b.coopmat_m, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
     }
 };
 
@@ -756,6 +757,8 @@ struct vk_device_struct {
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
+    bool coopmat_support_8x16x16_f16acc {};
+    bool coopmat_support_8x16x16_f32acc {};
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
     uint32_t coopmat_n;
@@ -1368,13 +1371,14 @@ struct vk_fa_tuning_params {
     uint32_t row_split;
     bool shmem_staging;
     uint32_t v_transpose;
+    uint32_t coopmat_m;
     bool disable_subgroups;
     uint32_t limit_occupancy_shmem;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
                      " block_rows=" << block_rows << " block_cols=" << block_cols << " d_split=" << d_split <<
-                     " row_split=" << row_split << " shmem_staging=" << shmem_staging << " v_transpose=" << v_transpose << " disable_subgroups=" << disable_subgroups <<
+                     " row_split=" << row_split << " shmem_staging=" << shmem_staging << " v_transpose=" << v_transpose << " coopmat_m=" << coopmat_m << " disable_subgroups=" << disable_subgroups <<
                      " limit_occupancy_shmem=" << limit_occupancy_shmem << std::endl;
     }
 };
