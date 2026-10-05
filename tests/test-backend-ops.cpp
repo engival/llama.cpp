@@ -11897,6 +11897,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // yue2 NAR runs unmasked unless N needs padding (and then mask-opt skips all but the last block)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 9408, 3823, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_pad_mask(128, 128, 8, {2, 1}, 9408, 3823, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // yue2 NAR per-head q/k norm + NEOX rope (head_dim 128, 16 q / 8 kv heads, 3823 tokens)
+    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 16, 3823, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX));
+    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 8, 3823, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX));
     for (int64_t kv : { 4096, 16384, 65536 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
